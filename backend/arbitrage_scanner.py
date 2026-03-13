@@ -1,5 +1,5 @@
 """
-PM Intelligence v4.1 — Arbitrage/Value Bet Scanner (Strategy 5)
+PM Intelligence v4.2 — Arbitrage/Value Bet Scanner (Strategy 5)
 
 NERFED in v4.1:
 - YES price range tightened: 0.15-0.35 (was 0.10-0.40)
@@ -7,9 +7,16 @@ NERFED in v4.1:
 - Min liquidity raised: $10,000 (was $1,000)
 - Days left: <=0.5 day / 12 hours (was <=1 day)
 - Added Haiku direction verification before entry
+
+v4.2 FIXES:
+- Added SPORTS_BLACKLIST — no college basketball, football, soccer, etc.
+- Added CRYPTO_BOOST — prefer crypto markets where we have data edge (Binance feed)
+- Require Haiku verify to PASS (was failing silently and allowing through)
+- Reduced max signals per scan to 3 (was unlimited)
 """
 
 import json
+import os
 from datetime import datetime
 from typing import Optional
 
@@ -17,14 +24,43 @@ from typing import Optional
 MIN_SPREAD_PCT = 0.025  # 2.5% minimum spread (0.5% profit after fees)
 MIN_LIQUIDITY = 10000    # v4.1 FIX: $10K minimum (was $1K)
 MAX_ENTRY_PRICE = 0.98
+MAX_SIGNALS_PER_SCAN = 3  # v4.2: Don't flood with arb signals
 
 # Track entered arbitrage markets to prevent double-entry
 _arb_entered: set = set()
 
+# v4.2: Track Haiku-rejected markets to avoid re-verifying every loop
+_haiku_rejected: set = set()
+
+# v4.2: Sports/entertainment blacklist — zero informational edge on these
+SPORTS_BLACKLIST = (
+    # College sports
+    "aggies", "titans", "spartans", "lobos", "bulldogs", "wildcats",
+    "bears", "tigers", "eagles", "hawks", "mustangs", "cougars",
+    "huskies", "panthers", "cardinals", "longhorns", "wolverines",
+    "buckeyes", "crimson", "jayhawks", "hoosiers", "badgers",
+    # Sports terms
+    "vs.", "vs ", "match", "game score", "championship", "tournament",
+    "ncaa", "nba", "nfl", "mlb", "nhl", "mls", "ufc", "wwe",
+    "premier league", "la liga", "serie a", "bundesliga", "ligue 1",
+    "super bowl", "world cup", "playoff", "semifinals", "quarterfinal",
+    "march madness", "bowl game", "all-star",
+    # Entertainment
+    "oscar", "grammy", "emmy", "golden globe", "academy award",
+    "bachelor", "bachelorette", "survivor", "idol",
+    "box office", "opening weekend",
+)
+
+# v4.2: Crypto keywords — markets where we have Binance data edge
+CRYPTO_KEYWORDS = (
+    "bitcoin", "btc", "ethereum", "eth", "solana", "sol",
+    "crypto", "xrp", "doge", "up or down", "price of",
+    "market cap", "above $", "below $", "dip to",
+)
+
 # v4.1: Haiku verification for direction
 try:
     import anthropic
-    import os
     _HAS_ANTHROPIC = True
     _API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 except ImportError:
@@ -32,23 +68,41 @@ except ImportError:
     _API_KEY = ""
 
 
+def _is_sports_market(question: str) -> bool:
+    """Check if market is sports/entertainment — we have zero edge on these."""
+    q = question.lower()
+    return any(word in q for word in SPORTS_BLACKLIST)
+
+
+def _is_crypto_market(question: str) -> bool:
+    """Check if market is crypto — we have Binance data edge."""
+    q = question.lower()
+    return any(word in q for word in CRYPTO_KEYWORDS)
+
+
 async def _verify_direction_haiku(question: str, direction: str, price: float) -> bool:
-    """Use Haiku to verify if the direction makes sense for this market."""
+    """Use Haiku to verify if the direction makes sense for this market.
+    v4.2: On error/rate limit, reject (conservative).
+    """
     if not _HAS_ANTHROPIC or not _API_KEY:
-        return True  # Can't verify, allow through
+        return False  # v4.2 FIX: Can't verify = DON'T enter (was True)
 
-    try:
-        client = anthropic.AsyncAnthropic(api_key=_API_KEY)
-        model = os.getenv("LLM_SCREEN_MODEL", "claude-haiku-4-5-20251001")
+    client = anthropic.AsyncAnthropic(api_key=_API_KEY)
+    model = os.getenv("LLM_SCREEN_MODEL", "claude-haiku-4-5-20251001")
 
-        prompt = f"""Quick check: Should we BUY {direction} on this prediction market?
+    prompt = f"""Quick check: Should we BUY {direction} on this prediction market?
 
 Question: "{question}"
 Current YES price: ${price:.2f}
 This market resolves within 12 hours.
 
+Consider: Do we have any informational edge here? Is the price likely mispriced?
+If this is a sports game, political event, or anything unpredictable, answer NO.
+Only answer YES if there's a clear reason the market is mispriced.
+
 Answer ONLY "YES" or "NO". YES means the trade makes sense, NO means it's likely a bad bet."""
 
+    try:
         response = await client.messages.create(
             model=model,
             max_tokens=10,
@@ -58,16 +112,16 @@ Answer ONLY "YES" or "NO". YES means the trade makes sense, NO means it's likely
         answer = response.content[0].text.strip().upper()
         return answer.startswith("YES")
 
-    except Exception:
-        return True  # On error, allow through
+    except Exception as e:
+        print(f"[ARB] Haiku verify error: {e}")
+        return False  # On any error (including rate limit), DON'T enter
 
 
 def scan_arbitrage_opportunities(markets: list) -> list:
     """
     Scan all markets for arbitrage/mispricing opportunities.
 
-    v4.1 NERFED: Tighter price ranges, higher liquidity, shorter resolution window.
-    Haiku verification added (called async from main.py wrapper).
+    v4.2: Added sports blacklist, crypto preference, signal cap.
     """
     signals = []
 
@@ -78,15 +132,20 @@ def scan_arbitrage_opportunities(markets: list) -> list:
             yes_price = market.get("yes_price", 0.5)
             liquidity = market.get("liquidity", 0) or 0
 
-            # Skip if already entered or low liquidity
+            # Skip if already entered, rejected, or low liquidity
             if market_id in _arb_entered:
                 continue
-            # v4.1 FIX: $10K minimum (was $1K)
+            if market_id in _haiku_rejected:
+                continue
             if liquidity < MIN_LIQUIDITY:
                 continue
 
             # Skip closed or inactive markets
             if market.get("closed", False) or not market.get("active", True):
+                continue
+
+            # v4.2 FIX: Skip sports/entertainment markets — zero edge
+            if _is_sports_market(question):
                 continue
 
             no_price = 1 - yes_price
@@ -104,6 +163,9 @@ def scan_arbitrage_opportunities(markets: list) -> list:
                         f"MISPRICING: YES@{yes_price:.2f} on high-liq market resolving <12h"
                     )
                     if signal:
+                        # v4.2: Boost score for crypto markets (data edge)
+                        if _is_crypto_market(question):
+                            signal["score"] = min(95, signal["score"] + 10)
                         signal["_needs_haiku_verify"] = True
                         signals.append(signal)
 
@@ -114,11 +176,18 @@ def scan_arbitrage_opportunities(markets: list) -> list:
                         f"MISPRICING: NO@{no_price:.2f} on high-liq market resolving <12h"
                     )
                     if signal:
+                        if _is_crypto_market(question):
+                            signal["score"] = min(95, signal["score"] + 10)
                         signal["_needs_haiku_verify"] = True
                         signals.append(signal)
 
         except Exception:
             continue
+
+    # v4.2: Cap signals per scan — prioritize by score
+    if len(signals) > MAX_SIGNALS_PER_SCAN:
+        signals.sort(key=lambda s: -s["score"])
+        signals = signals[:MAX_SIGNALS_PER_SCAN]
 
     if signals:
         print(f"[ARB-SCAN] Found {len(signals)} potential value bet signals")
