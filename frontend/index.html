@@ -1062,19 +1062,47 @@ body::before {
       if (sd) {
         var sigContainer = el('signals-debug-body');
         clearChildren(sigContainer);
+
+        // Separate signal counts from stats
+        var signalFields = {};
+        var statFields = {};
+        var nonSignalKeys = { total_entered: 1, trades_closed_this_session: 1, loops_run: 1, last_loop: 1 };
+        Object.keys(sd).forEach(function(name) {
+          if (nonSignalKeys[name]) {
+            statFields[name] = sd[name];
+          } else {
+            signalFields[name] = sd[name];
+          }
+        });
+
+        // Signal counts section
+        var sigLabel = makeEl('div', { style: 'font-size:11px;color:var(--pink);font-weight:600;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;' }, 'Active Signals');
+        sigContainer.appendChild(sigLabel);
         var sigGrid = makeEl('div', { className: 'status-grid' });
         var totalSigs = 0;
-        Object.keys(sd).forEach(function(name) {
-          var val = sd[name];
-          var label = name.replace(/_/g, ' ');
+        Object.keys(signalFields).forEach(function(name) {
+          var val = signalFields[name];
+          var label = name.replace(/_signals?$/, '').replace(/_/g, ' ');
           if (typeof val === 'number') {
             totalSigs += val;
             sigGrid.appendChild(makeStatusItem(label, String(val)));
-          } else if (typeof val === 'string') {
-            sigGrid.appendChild(makeStatusItem(label, val));
           }
         });
         sigContainer.appendChild(sigGrid);
+
+        // Stats section
+        var statsLabel = makeEl('div', { style: 'font-size:11px;color:var(--dim);font-weight:600;text-transform:uppercase;letter-spacing:0.5px;margin:12px 0 6px;border-top:1px solid var(--border);padding-top:10px;' }, 'Session Stats');
+        sigContainer.appendChild(statsLabel);
+        var statsGrid = makeEl('div', { className: 'status-grid' });
+        if (statFields.loops_run != null) statsGrid.appendChild(makeStatusItem('Loops Run', Number(statFields.loops_run).toLocaleString()));
+        if (statFields.total_entered != null) statsGrid.appendChild(makeStatusItem('Trades Entered', String(statFields.total_entered)));
+        if (statFields.trades_closed_this_session != null) statsGrid.appendChild(makeStatusItem('Trades Closed', String(statFields.trades_closed_this_session)));
+        if (statFields.last_loop) {
+          var loopTime = new Date(statFields.last_loop);
+          statsGrid.appendChild(makeStatusItem('Last Loop', loopTime.toLocaleTimeString()));
+        }
+        sigContainer.appendChild(statsGrid);
+
         el('signal-count').textContent = totalSigs + ' signals';
       }
     } catch(e) { console.error('renderDebug signals:', e); }
