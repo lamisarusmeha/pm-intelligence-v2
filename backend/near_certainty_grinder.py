@@ -89,8 +89,8 @@ def _verify_crypto_near_certainty(market: dict, binance_prices: dict) -> bool:
     Verify a crypto market's outcome is near-certain using Binance prices.
 
     Example: "Will BTC reach $50K?" with YES at 0.88
-    - Binance says BTC is $69K â $69K > $50K â YES is correct â verified
-    - Binance says BTC is $48K â $48K < $50K â YES might not happen â not verified
+    - Binance says BTC is $69K \u2192 $69K > $50K \u2192 YES is correct \u2192 verified
+    - Binance says BTC is $48K \u2192 $48K < $50K \u2192 YES might not happen \u2192 not verified
     """
     question = market.get("question", "")
     yes_price = market.get("yes_price", 0.5)
@@ -116,17 +116,17 @@ def _verify_crypto_near_certainty(market: dict, binance_prices: dict) -> bool:
     # Verify: does exchange price support the high-probability outcome?
     if yes_price >= 0.80:  # Market says YES is likely
         if is_above:
-            # "Will BTC reach $50K?" YES at 88% â BTC should be well above $50K
+            # "Will BTC reach $50K?" YES at 88% \u2192 BTC should be well above $50K
             verified = exchange_price > threshold * 1.05  # 5% buffer
         else:
-            # "Will BTC dip to $40K?" YES at 88% â BTC should be near/below $40K
+            # "Will BTC dip to $40K?" YES at 88% \u2192 BTC should be near/below $40K
             verified = exchange_price < threshold * 1.05
     elif yes_price <= 0.20:  # Market says NO is likely (YES is cheap)
         if is_above:
-            # "Will BTC reach $100K?" YES at 12% â BTC should be well below $100K
+            # "Will BTC reach $100K?" YES at 12% \u2192 BTC should be well below $100K
             verified = exchange_price < threshold * 0.80  # 20% buffer
         else:
-            # "Will BTC dip to $20K?" YES at 12% â BTC should be well above $20K
+            # "Will BTC dip to $20K?" YES at 12% \u2192 BTC should be well above $20K
             verified = exchange_price > threshold * 1.20
     else:
         verified = False  # Price isn't extreme enough for near-certainty
@@ -141,19 +141,20 @@ async def _verify_with_haiku(market: dict) -> bool:
     """
     Quick Haiku check for non-crypto markets.
     Costs ~$0.001 per call. Only called for markets passing all other filters.
+    v4.2: On rate limit, allow through (grinder has strong heuristic filters).
     """
     if not HAS_ANTHROPIC or not ANTHROPIC_API_KEY:
         return True  # No API key, allow it (graceful degradation)
 
+    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+    question = market.get("question", "")
+    yes_price = market.get("yes_price", 0.5)
+    days = _days_left(market.get("end_date", ""))
+
+    direction = "YES" if yes_price >= 0.80 else "NO"
+    prob = yes_price if direction == "YES" else (1 - yes_price)
+
     try:
-        client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-        question = market.get("question", "")
-        yes_price = market.get("yes_price", 0.5)
-        days = _days_left(market.get("end_date", ""))
-
-        direction = "YES" if yes_price >= 0.80 else "NO"
-        prob = yes_price if direction == "YES" else (1 - yes_price)
-
         response = await client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=10,
@@ -168,8 +169,13 @@ async def _verify_with_haiku(market: dict) -> bool:
         return "YES" in answer
 
     except Exception as e:
+        if "429" in str(e):
+            # v4.2: Rate limited \u2014 allow through since grinder has strong
+            # heuristic filters already (80%+ probability, near resolution)
+            print(f"[GRIND] Rate limited \u2014 allowing through (strong heuristic filters)")
+            return True
         print(f"[GRIND] Haiku verify error: {e}")
-        return False  # Don't enter if verification fails
+        return False
 
 
 async def generate_near_certainty_signals(markets: list, binance_prices: dict) -> list:
