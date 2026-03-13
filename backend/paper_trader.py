@@ -162,10 +162,6 @@ def get_risk_status() -> dict:
         "circuit_breaker_reason": _circuit_breaker_reason,
         "daily_loss_limit_pct": DAILY_LOSS_LIMIT_PCT,
         "drawdown_pause_pct": DRAWDOWN_PAUSE_PCT,
-    }
-        "circuit_breaker_reason": _circuit_breaker_reason,
-        "daily_loss_limit_pct": DAILY_LOSS_LIMIT_PCT,
-        "drawdown_pause_pct": DRAWDOWN_PAUSE_PCT,
         "pct_stop_losses": PCT_STOP_LOSS,
     }
 
