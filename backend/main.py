@@ -153,6 +153,18 @@ async def lifespan(app):
             await conn.execute("DELETE FROM signal_performance WHERE trade_id = -1")
             await conn.commit()
         print("[STARTUP] Memory system diagnostic: PASS")
+    except Excepti")
+
+        # Test self_improvement_engine
+        await sie.record_trade_result(
+            trade_id=-1, market_type="TEST", direction="YES",
+            entry_price=0.5, exit_price=0.6, pnl=0.1, won=True,
+            signal_factors={},
+        )
+        async with aiosqlite.connect(db.DB_PATH) as conn:
+            await conn.execute("DELETE FROM signal_performance WHERE trade_id = -1")
+            await conn.commit()
+        print("[STARTUP] Memory system diagnostic: PASS")
     except Exception as e:
         err_msg = f"[STARTUP] Memory system diagnostic FAILED: {e}"
         print(err_msg)
@@ -621,7 +633,7 @@ async def llm_analysis_cycle(markets: list) -> list:
 
 async def trading_loop():
     global _loop_count
-    print("[v4.1] PM Intelligence v4.1 — 6-Strategy Trading Agent")
+    print("[v4.1] PM Intelligence v4.1 \u2014 6-Strategy Trading Agent")
     print("[v4.1] Strategy 1: Near-Certainty Grinder")
     print("[v4.1] Strategy 2: Volume Spike Trading")
     print("[v4.1] Strategy 3: Binance Price Lag Arbitrage")
@@ -663,28 +675,34 @@ async def trading_loop():
             arb_signals = generate_arb_signals(markets)
             _strategy_debug["arb_signals"] = len(arb_signals)
 
-            # -- Strategy 5: Value Bet Scanner (EVERY loop) --
-            arb_scan_signals = scan_arbitrage_opportunities(markets)
-            # v4.1 FIX: Haiku verification for arbitrage signals
-            verified_arb_signals = []
-            for sig in arb_scan_signals:
-                if sig.get("_needs_haiku_verify"):
-                    try:
-                        ok = await _verify_direction_haiku(
-                            sig["market_question"],
-                            sig["direction"],
-                            sig["yes_price"]
-                        )
-                        if ok:
-                            del sig["_needs_haiku_verify"]
-                            verified_arb_signals.append(sig)
-                        else:
-                            print(f"[ARB-SCAN] Haiku rejected: {sig['direction']} on '{sig['market_question'][:40]}'")
-                    except Exception:
-                        verified_arb_signals.append(sig)  # On error, allow through
-                else:
-                    verified_arb_signals.append(sig)
-            arb_scan_signals = verified_arb_signals
+            # -- Strategy 5: Value Bet Scanner (every 10th loop — was every loop) --
+            arb_scan_signals = []
+            if _loop_count % 10 == 0:
+                arb_scan_signals = scan_arbitrage_opportunities(markets)
+                # v4.1 FIX: Haiku verification for arbitrage signals
+                verified_arb_signals = []
+                for sig in arb_scan_signals:
+                    if sig.get("_needs_haiku_verify"):
+                        try:
+                            ok = await _verify_direction_haiku(
+                                sig["market_question"],
+                                sig["direction"],
+                                sig["yes_price"]
+                            )
+                            if ok:
+                                del sig["_needs_haiku_verify"]
+                                verified_arb_signals.append(sig)
+                            else:
+                                print(f"[ARB-SCAN] Haiku rejected: {sig['direction']} on '{sig['market_question'][:40]}'")
+                                # v4.2: Cache rejection so we don't re-verify
+                                from arbitrage_scanner import _haiku_rejected
+                                _haiku_rejected.add(sig["market_id"])
+                        except Exception as e:
+                            print(f"[ARB-SCAN] Haiku verify error: {e}")
+                            # v4.2: On error, DON'T allow through (was allowing)
+                    else:
+                        verified_arb_signals.append(sig)
+                arb_scan_signals = verified_arb_signals
             _strategy_debug["arbitrage_signals"] = len(arb_scan_signals)
 
             # -- Strategy 4: Short-Duration (every 3rd loop) --
