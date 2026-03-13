@@ -895,7 +895,7 @@ body::before {
      ============================================ */
   function renderTrades() {
     var open = allTrades.filter(function(t) { return t.status === 'OPEN'; });
-    var closed = allTrades.filter(function(t) { return t.status === 'WON' || t.status === 'LOST'; });
+    var closed = allTrades.filter(function(t) { return t.status !== 'OPEN'; });
 
     el('open-count').textContent = open.length + ' open';
     el('closed-count').textContent = closed.length + ' closed';
@@ -962,8 +962,10 @@ body::before {
         var pnl = t.pnl || 0;
         tr.appendChild(makeTd(pnlSign(pnl), { className: pnlClass(pnl) }));
 
-        var resCls = (t.status === 'WON') ? 'badge-won' : 'badge-lost';
-        tr.appendChild(makeTd(makeBadge(t.status, resCls)));
+        var isWin = (t.status === 'WIN' || t.status === 'WON');
+        var resCls = isWin ? 'badge-won' : 'badge-lost';
+        var label = isWin ? 'WIN' : (t.status === 'STOP_LOSS' ? 'STOP LOSS' : t.status);
+        tr.appendChild(makeTd(makeBadge(label, resCls)));
 
         var stratTd = makeEl('td');
         stratTd.appendChild(makeBadge(
@@ -989,8 +991,8 @@ body::before {
       var key = t.market_type || 'UNKNOWN';
       if (!byType[key]) byType[key] = { trades: 0, wins: 0, losses: 0, pnl: 0 };
       byType[key].trades++;
-      if (t.status === 'WON') byType[key].wins++;
-      if (t.status === 'LOST') byType[key].losses++;
+      if (t.status === 'WIN' || t.status === 'WON') byType[key].wins++;
+      if (t.status === 'STOP_LOSS' || t.status === 'LOST' || t.status === 'LOSS') byType[key].losses++;
       byType[key].pnl += (t.pnl || 0);
     });
 
