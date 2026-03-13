@@ -885,8 +885,17 @@ body::before {
     el('m-winrate').textContent = wr;
     el('m-winloss').textContent = (p.win_count || 0) + 'W / ' + (p.loss_count || 0) + 'L';
 
-    pnlHistory.push({ time: new Date(), pnl: p.total_pnl || 0 });
-    if (pnlHistory.length > 100) pnlHistory.shift();
+    // Only record PnL once per hour
+    var now = new Date();
+    var lastEntry = pnlHistory.length > 0 ? pnlHistory[pnlHistory.length - 1] : null;
+    var hourChanged = !lastEntry || now.getHours() !== lastEntry.time.getHours() || (now - lastEntry.time) >= 3600000;
+    if (hourChanged) {
+      pnlHistory.push({ time: now, pnl: p.total_pnl || 0 });
+      if (pnlHistory.length > 48) pnlHistory.shift();
+    } else {
+      // Update the latest entry's PnL value to keep it current
+      pnlHistory[pnlHistory.length - 1].pnl = p.total_pnl || 0;
+    }
     renderPnlChart();
   }
 
@@ -1141,7 +1150,7 @@ body::before {
     if (!ctx) return;
 
     var labels = pnlHistory.map(function(p) {
-      return p.time.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+      return p.time.toLocaleTimeString('en-US', { hour: 'numeric', hour12: true });
     });
     var data = pnlHistory.map(function(p) { return p.pnl; });
 
