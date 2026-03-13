@@ -95,7 +95,9 @@ VOLUME_SPIKE_SL = 0.03
 VOLUME_SPIKE_HOLD_HOURS = 2.0
 BINANCE_ARB_HOLD_HOURS = 0.15
 SHORT_DURATION_HOLD_HOURS = 0.5
-ARBITRAGE_HOLD_HOURS = 48.0
+ARBITRAGE_TP = 0.08          # v4.2: Take profit at +8c (was None/resolution only)
+ARBITRAGE_SL = 0.06          # v4.2: Stop loss at -6c (was None/resolution only)
+ARBITRAGE_HOLD_HOURS = 24.0  # v4.2: Reduced from 48h — don't hold stale arb bets
 
 COPY_TRADE_TP = 0.04
 COPY_TRADE_SL = 0.03
@@ -157,6 +159,10 @@ def get_risk_status() -> dict:
         "daily_trades_closed": _daily_pnl.get("trades_closed", 0),
         "session_peak_balance": round(_session_peak_balance, 2),
         "circuit_breaker_active": _circuit_breaker_active,
+        "circuit_breaker_reason": _circuit_breaker_reason,
+        "daily_loss_limit_pct": DAILY_LOSS_LIMIT_PCT,
+        "drawdown_pause_pct": DRAWDOWN_PAUSE_PCT,
+    }
         "circuit_breaker_reason": _circuit_breaker_reason,
         "daily_loss_limit_pct": DAILY_LOSS_LIMIT_PCT,
         "drawdown_pause_pct": DRAWDOWN_PAUSE_PCT,
@@ -268,19 +274,25 @@ def _kelly_position_size(portfolio: dict, signal: dict) -> float:
 # ── Entry ──────────────────────────────────────────────────────────────────────
 
 async def maybe_enter_trade(signal: dict) -> Optional[dict]:
+    mt = signal.get("market_type", "?")
+    q = signal.get("market_question", "")[:40]
+
     score = signal.get("score", 0)
     if score < ENTRY_THRESHOLD:
+        print(f"[GATE] score {score} < {ENTRY_THRESHOLD} — skip '{q}'")
         return None
 
     if not signal.get("can_enter", False):
+        print(f"[GATE] can_enter=False — skip '{q}'")
         return None
 
     open_trades = await db.get_open_paper_trades()
     if len(open_trades) >= MAX_OPEN_TRADES:
+        print(f"[GATE] max trades ({len(open_trades)}/{MAX_OPEN_TRADES}) — skip")
         return None
 
     if signal["market_id"] in {t["market_id"] for t in open_trades}:
-        return None
+        return None  # Silent — expected for duplicate markets
 
     portfolio = await db.get_portfolio()
 
@@ -291,32 +303,36 @@ async def maybe_enter_trade(signal: dict) -> Optional[dict]:
 
     cost = _kelly_position_size(portfolio, signal)
     if cost < 1.0:
+        print(f"[GATE] Kelly size too small (${cost:.2f}) for {mt} — skip '{q}'")
         return None
     if cost > portfolio.get("cash_balance", 0):
+        print(f"[GATE] Insufficient cash for ${cost:.2f} — skip")
         return None
 
     direction = signal.get("direction", "YES")
     market_type = signal.get("market_type", "MOMENTUM")
 
     if direction == "NO" and market_type not in NO_ALLOWED_TYPES:
+        print(f"[GATE] NO not allowed for {market_type} — skip '{q}'")
         return None
 
     yes_price = signal.get("yes_price", 0.5)
     entry_price = yes_price if direction == "YES" else (1 - yes_price)
     if entry_price <= 0:
+        print(f"[GATE] entry_price <= 0 — skip '{q}'")
         return None
 
     # Range market blacklist
     question_lower = signal.get("market_question", "").lower()
     if market_type in ("NEAR_CERTAINTY", "LLM_ANALYSIS"):
         if any(word in question_lower for word in RANGE_BLACKLIST_WORDS):
-            print(f"[GATE] RANGE market blacklisted – skip '{signal['market_question'][:40]}'")
+            print(f"[GATE] RANGE market blacklisted – skip '{q}'")
             return None
 
     # Extreme price guard
     max_price = 0.93 if market_type == "NEAR_CERTAINTY" else 0.95
     if entry_price > max_price or entry_price < 0.05:
-        print(f"[GATE] EXTREME price {entry_price:.4f} – skip '{signal['market_question'][:40]}'")
+        print(f"[GATE] EXTREME price {entry_price:.4f} (max={max_price}) – skip '{q}'")
         return None
 
     shares = round(cost / entry_price, 4)
@@ -587,8 +603,8 @@ async def check_exits(markets_by_id: dict):
             stop_loss_delta = None
             max_hold_hours = BINANCE_ARB_HOLD_HOURS
         elif market_type == "ARBITRAGE":
-            take_profit_delta = None
-            stop_loss_delta = None
+            take_profit_delta = ARBITRAGE_TP    # v4.2: was None
+            stop_loss_delta = ARBITRAGE_SL      # v4.2: was None
             max_hold_hours = ARBITRAGE_HOLD_HOURS
         elif market_type == "LLM_ANALYSIS":
             take_profit_delta = LLM_ANALYSIS_TP
@@ -642,7 +658,8 @@ async def check_exits(markets_by_id: dict):
             continue
 
         # Resolution-based strategies: close on resolution + percentage stop-loss
-        if market_type in ("NEAR_CERTAINTY", "SHORT_DURATION", "BINANCE_ARB", "ARBITRAGE"):
+        # v4.2: ARBITRAGE removed — now uses delta TP/SL like other strategies
+        if market_type in ("NEAR_CERTAINTY", "SHORT_DURATION", "BINANCE_ARB"):
             # Take profit: resolved in our favor
             if direction == "YES" and yes_price >= 0.97:
                 await _close_at_price(trade, cur_price, "TAKE_PROFIT")
@@ -658,7 +675,7 @@ async def check_exits(markets_by_id: dict):
                 await _close_at_price(trade, cur_price, "STOP_LOSS")
                 continue
 
-            # v4.1 FIX: ARBITRAGE now has percentage stop-loss (was exempt at 100%)
+            # Percentage stop-loss for resolution-based strategies
             if entry_px > 0:
                 loss_pct = (cur_price - entry_px) / entry_px
                 stop_threshold = PCT_STOP_LOSS.get(market_type, DEFAULT_PCT_STOP_LOSS)
@@ -670,7 +687,7 @@ async def check_exits(markets_by_id: dict):
                     continue
             continue
 
-        # Standard TP/SL for other types
+        # Standard TP/SL for all other types (including ARBITRAGE v4.2)
         if take_profit_delta is None or stop_loss_delta is None:
             continue
 
