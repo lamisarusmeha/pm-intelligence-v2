@@ -153,18 +153,6 @@ async def lifespan(app):
             await conn.execute("DELETE FROM signal_performance WHERE trade_id = -1")
             await conn.commit()
         print("[STARTUP] Memory system diagnostic: PASS")
-    except Excepti")
-
-        # Test self_improvement_engine
-        await sie.record_trade_result(
-            trade_id=-1, market_type="TEST", direction="YES",
-            entry_price=0.5, exit_price=0.6, pnl=0.1, won=True,
-            signal_factors={},
-        )
-        async with aiosqlite.connect(db.DB_PATH) as conn:
-            await conn.execute("DELETE FROM signal_performance WHERE trade_id = -1")
-            await conn.commit()
-        print("[STARTUP] Memory system diagnostic: PASS")
     except Exception as e:
         err_msg = f"[STARTUP] Memory system diagnostic FAILED: {e}"
         print(err_msg)
@@ -633,7 +621,7 @@ async def llm_analysis_cycle(markets: list) -> list:
 
 async def trading_loop():
     global _loop_count
-    print("[v4.1] PM Intelligence v4.1 \u2014 6-Strategy Trading Agent")
+    print("[v4.1] PM Intelligence v4.1 — 6-Strategy Trading Agent")
     print("[v4.1] Strategy 1: Near-Certainty Grinder")
     print("[v4.1] Strategy 2: Volume Spike Trading")
     print("[v4.1] Strategy 3: Binance Price Lag Arbitrage")
