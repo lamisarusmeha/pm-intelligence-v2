@@ -1000,8 +1000,11 @@ async def get_trade_timeline(limit: int = 100) -> list:
         async with db.execute("""
             SELECT pt.*, te.entry_explanation, te.exit_explanation, te.lesson as te_lesson,
                    te.factors_json as te_factors, te.score as te_score,
-                   tm.entry_reasoning, tm.exit_outcome, tm.lesson as tm_lesson,
-                   tm.category as tm_category
+                   tm.reasoning as entry_reasoning, tm.outcome as exit_outcome,
+                   tm.lesson as tm_lesson, tm.category as tm_category,
+                   tm.confidence as tm_confidence, tm.edge as tm_edge,
+                   tm.key_evidence as tm_key_evidence, tm.risk_factors as tm_risk_factors,
+                   tm.model_used as tm_model
             FROM paper_trades pt
             LEFT JOIN trade_explanations te ON te.trade_id = pt.id
             LEFT JOIN trade_memory tm ON tm.trade_id = pt.id

@@ -89,7 +89,7 @@ def _is_crypto_market(question: str) -> bool:
 
 # ── Strategy Exit Constants ────────────────────────────────────────────────────
 
-NEAR_CERTAINTY_HOLD_HOURS = 48.0
+NEAR_CERTAINTY_HOLD_HOURS = 24.0   # v4.3: was 48h — faster feedback loop
 VOLUME_SPIKE_TP = 0.04
 VOLUME_SPIKE_SL = 0.03
 VOLUME_SPIKE_HOLD_HOURS = 2.0
@@ -112,9 +112,12 @@ MOMENTUM_TP = 0.06
 MOMENTUM_SL = 0.04
 MOMENTUM_HOLD_HOURS = 2
 
-LLM_ANALYSIS_TP = 0.06
-LLM_ANALYSIS_SL = 0.05
-LLM_ANALYSIS_HOLD_HOURS = 8.0
+# v4.3 FIX: LLM trades on political/geopolitical markets move slowly
+# Old: TP=0.06, SL=0.05, 8h — too tight, trades timeout before moving
+# New: wider stops, longer hold — let the thesis play out
+LLM_ANALYSIS_TP = 0.10      # was 0.06 — need bigger moves to be meaningful
+LLM_ANALYSIS_SL = 0.08      # was 0.05 — avoid noise stop-outs
+LLM_ANALYSIS_HOLD_HOURS = 24.0  # was 8h — geopolitical events need time
 
 # Shared constants
 ENTRY_THRESHOLD = 40
@@ -225,6 +228,13 @@ def _get_position_cap(signal: dict) -> float:
 # ── Kelly Criterion ────────────────────────────────────────────────────────────
 
 def _kelly_position_size(portfolio: dict, signal: dict) -> float:
+    """
+    Kelly Criterion position sizing.
+
+    v4.3: For LLM_ANALYSIS trades, use the actual edge + confidence
+    from the LLM instead of hardcoded win probability. This means
+    high-edge, high-confidence trades get larger positions.
+    """
     cash = portfolio.get("cash_balance", 10000)
     market_type = signal.get("market_type", "MOMENTUM")
     direction = signal.get("direction", "YES")
@@ -234,7 +244,35 @@ def _kelly_position_size(portfolio: dict, signal: dict) -> float:
     if entry_price <= 0 or entry_price >= 1:
         return round(cash * BASE_RISK_PCT, 2)
 
-    p = KELLY_WIN_PROBS.get(market_type, 0.58)
+    # v4.3: For LLM trades, derive win probability from actual edge + confidence
+    if market_type == "LLM_ANALYSIS":
+        factors_raw = signal.get("factors_json", "{}")
+        if isinstance(factors_raw, str):
+            try:
+                factors = json.loads(factors_raw)
+            except Exception:
+                factors = {}
+        else:
+            factors = factors_raw
+
+        edge = factors.get("edge", 0)
+        confidence = factors.get("confidence", 0)
+        est_prob = factors.get("estimated_probability", 0.5)
+
+        # Use LLM's estimated probability as win probability
+        # But temper it: blend with base rate (shrink toward 0.5)
+        # Higher confidence = trust LLM more
+        if est_prob > 0 and confidence > 0:
+            # At confidence=1.0, use 70% of LLM estimate + 30% base
+            # At confidence=0.4, use 40% of LLM estimate + 60% base
+            trust_weight = min(0.7, confidence * 0.7)
+            base_p = KELLY_WIN_PROBS.get(market_type, 0.58)
+            p = trust_weight * est_prob + (1 - trust_weight) * base_p
+        else:
+            p = KELLY_WIN_PROBS.get(market_type, 0.58)
+    else:
+        p = KELLY_WIN_PROBS.get(market_type, 0.58)
+
     q = 1 - p
     b = (1 - entry_price) / entry_price
 
@@ -245,6 +283,7 @@ def _kelly_position_size(portfolio: dict, signal: dict) -> float:
     if kelly <= 0:
         return round(cash * 0.001, 2)
 
+    # Quarter Kelly for safety
     kelly_frac = kelly * 0.25
 
     score_bonus = min(0.2, (signal.get("score", 50) - 50) / 250)
@@ -254,12 +293,14 @@ def _kelly_position_size(portfolio: dict, signal: dict) -> float:
 
     cap = _get_position_cap(signal)
 
-    # v4.1 FIX: Removed special ARBITRAGE branch that forced 0.3-0.5% bets
-    # All strategies now use standard sizing
-
     # SHORT_DURATION: smaller positions since these resolve fast
     if market_type == "SHORT_DURATION":
         bet = max(cash * 0.001, min(cash * 0.003, bet))
+        return round(min(bet, cap), 2)
+
+    # LLM_ANALYSIS: allow up to 0.8% for high-edge trades (was 0.5%)
+    if market_type == "LLM_ANALYSIS":
+        bet = max(cash * 0.002, min(cash * 0.008, bet))
         return round(min(bet, cap), 2)
 
     # Standard: 0.2%-0.5% per trade

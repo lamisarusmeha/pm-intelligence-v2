@@ -733,7 +733,9 @@ body::before {
 
   function timeAgo(dateStr) {
     if (!dateStr) return '--';
-    var d = new Date(dateStr);
+    // DB stores UTC without Z suffix — append Z so JS parses as UTC
+    var s = dateStr.endsWith('Z') ? dateStr : dateStr + 'Z';
+    var d = new Date(s);
     var now = new Date();
     var diff = now - d;
     var mins = Math.floor(diff / 60000);
@@ -944,9 +946,10 @@ body::before {
         ));
         tr.appendChild(stratTd);
 
-        var tp = t.tp_price != null ? fmt(t.tp_price, 2) : '--';
-        var sl = t.sl_price != null ? fmt(t.sl_price, 2) : '--';
-        tr.appendChild(makeTd(tp + ' / ' + sl, { style: 'font-size:11px;color:var(--dim)' }));
+        var tp = t.tp_price != null ? fmt(t.tp_price, 3) : '--';
+        var sl = t.sl_price != null ? fmt(t.sl_price, 3) : '--';
+        var holdLabel = t.max_hold_hours ? ' (' + (t.max_hold_hours < 1 ? Math.round(t.max_hold_hours*60)+'m' : t.max_hold_hours+'h') + ')' : '';
+        tr.appendChild(makeTd(tp + ' / ' + sl + holdLabel, { style: 'font-size:11px;color:var(--dim)' }));
         tr.appendChild(makeTd(timeAgo(t.created_at), { style: 'font-size:11px;color:var(--dim)' }));
 
         tbody.appendChild(tr);

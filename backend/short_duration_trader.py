@@ -49,7 +49,7 @@ PRICE_CONFIRM_PCT = 0.001  # 0.1% â if Binance agrees with direction
 # V4.0: Range market blacklist â these caused catastrophic losses
 RANGE_BLACKLIST_WORDS = ("between", "be between", "range")
 
-# Slug patterns for short-duration markets
+# Slug patterns for short-duration markets — all 7 Polymarket rolling crypto assets
 SHORT_DURATION_PATTERNS = [
     # Pattern: (regex, asset, timeframe_minutes)
     (re.compile(r"btc-updown-5m-(\d+)", re.IGNORECASE), "BTC", 5),
@@ -58,6 +58,14 @@ SHORT_DURATION_PATTERNS = [
     (re.compile(r"eth-updown-15m-(\d+)", re.IGNORECASE), "ETH", 15),
     (re.compile(r"sol-updown-5m-(\d+)", re.IGNORECASE), "SOL", 5),
     (re.compile(r"sol-updown-15m-(\d+)", re.IGNORECASE), "SOL", 15),
+    (re.compile(r"xrp-updown-5m-(\d+)", re.IGNORECASE), "XRP", 5),
+    (re.compile(r"xrp-updown-15m-(\d+)", re.IGNORECASE), "XRP", 15),
+    (re.compile(r"bnb-updown-5m-(\d+)", re.IGNORECASE), "BNB", 5),
+    (re.compile(r"bnb-updown-15m-(\d+)", re.IGNORECASE), "BNB", 15),
+    (re.compile(r"doge-updown-5m-(\d+)", re.IGNORECASE), "DOGE", 5),
+    (re.compile(r"doge-updown-15m-(\d+)", re.IGNORECASE), "DOGE", 15),
+    (re.compile(r"hype-updown-5m-(\d+)", re.IGNORECASE), "HYPE", 5),
+    (re.compile(r"hype-updown-15m-(\d+)", re.IGNORECASE), "HYPE", 15),
 ]
 
 # Also match by question text patterns
@@ -68,6 +76,11 @@ QUESTION_PATTERNS = [
     (re.compile(r"eth\s+up\s+or\s+down", re.IGNORECASE), "ETH"),
     (re.compile(r"solana\s+up\s+or\s+down", re.IGNORECASE), "SOL"),
     (re.compile(r"sol\s+up\s+or\s+down", re.IGNORECASE), "SOL"),
+    (re.compile(r"xrp\s+up\s+or\s+down", re.IGNORECASE), "XRP"),
+    (re.compile(r"bnb\s+up\s+or\s+down", re.IGNORECASE), "BNB"),
+    (re.compile(r"doge(coin)?\s+up\s+or\s+down", re.IGNORECASE), "DOGE"),
+    (re.compile(r"hyperliquid\s+up\s+or\s+down", re.IGNORECASE), "HYPE"),
+    (re.compile(r"hype\s+up\s+or\s+down", re.IGNORECASE), "HYPE"),
 ]
 
 

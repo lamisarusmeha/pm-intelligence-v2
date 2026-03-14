@@ -445,6 +445,111 @@ async def fetch_markets() -> list:
         return []
 
 
+_rolling_cache = {"markets": [], "window_5m": 0, "window_15m": 0, "last_full_fetch": 0}
+
+async def fetch_rolling_crypto_markets() -> list:
+    """
+    Fetch CURRENTLY LIVE rolling 5M/15M crypto up/down markets.
+
+    Key insight: The generic events API only returns FUTURE markets (24h away).
+    Live markets must be fetched by exact slug using the current timestamp.
+
+    Optimization: Cache results per window. Only re-fetch when the window changes
+    or every 30s for price updates. BTC is always fetched (primary target).
+    """
+    import time as _time
+
+    ASSETS = ["btc", "eth", "sol", "xrp", "bnb", "doge", "hype"]
+    now_ts = int(_time.time())
+
+    # Calculate current window START timestamps (slug uses START, not end!)
+    # 5M window: starts at (now // 300) * 300, ends 300s later
+    # 15M window: starts at (now // 900) * 900, ends 900s later
+    current_5m_start = (now_ts // 300) * 300
+    current_15m_start = (now_ts // 900) * 900
+    secs_left_5m = (current_5m_start + 300) - now_ts  # seconds until 5M window closes
+
+    # If same window and fetched recently (within 15s), return cache
+    # EXCEPT in last 60s of window — always refresh for latest prices
+    cache = _rolling_cache
+    same_window = (cache["window_5m"] == current_5m_start and cache["window_15m"] == current_15m_start)
+    recently_fetched = (now_ts - cache["last_full_fetch"]) < 15
+    in_critical_zone = secs_left_5m <= 60
+
+    if same_window and recently_fetched and not in_critical_zone and cache["markets"]:
+        return cache["markets"]
+
+    # In critical zone (last 60s): only fetch BTC for speed
+    # Outside critical zone: fetch all assets
+    if in_critical_zone:
+        assets_to_fetch = ["btc"]  # BTC only in last 60s — speed is everything
+    else:
+        assets_to_fetch = ASSETS
+
+    slugs_to_fetch = []
+    for asset in assets_to_fetch:
+        # Current window (slug uses START timestamp)
+        slugs_to_fetch.append(f"{asset}-updown-5m-{current_5m_start}")
+        slugs_to_fetch.append(f"{asset}-updown-15m-{current_15m_start}")
+
+    # Outside critical zone, also fetch next windows for reference price tracking
+    if not in_critical_zone:
+        next_5m_start = current_5m_start + 300
+        next_15m_start = current_15m_start + 900
+        for asset in assets_to_fetch:
+            slugs_to_fetch.append(f"{asset}-updown-5m-{next_5m_start}")
+            slugs_to_fetch.append(f"{asset}-updown-15m-{next_15m_start}")
+
+    rolling_markets = []
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            import asyncio as _asyncio
+            tasks = [
+                client.get(f"{GAMMA_API}/events", params={"slug": slug})
+                for slug in slugs_to_fetch
+            ]
+            responses = await _asyncio.gather(*tasks, return_exceptions=True)
+
+            for resp in responses:
+                if isinstance(resp, Exception):
+                    continue
+                if resp.status_code != 200:
+                    continue
+                events = resp.json()
+                if not isinstance(events, list) or not events:
+                    continue
+                for event in events:
+                    for m in event.get("markets", []):
+                        parsed = _parse_market(m)
+                        if parsed:
+                            rolling_markets.append(parsed)
+
+        # In critical zone with BTC-only fetch, merge with cached non-BTC markets
+        if in_critical_zone and cache["markets"]:
+            btc_ids = {m["id"] for m in rolling_markets}
+            for m in cache["markets"]:
+                if m["id"] not in btc_ids:
+                    rolling_markets.append(m)
+
+        # Update cache
+        cache["markets"] = rolling_markets
+        cache["window_5m"] = current_5m_start
+        cache["window_15m"] = current_15m_start
+        cache["last_full_fetch"] = now_ts
+
+        if rolling_markets:
+            zone = "⚡CRITICAL" if in_critical_zone else "normal"
+            print(
+                f"[ROLLING] {len(rolling_markets)} markets "
+                f"(5m closes in {secs_left_5m}s, {zone})"
+            )
+        return rolling_markets
+
+    except Exception as e:
+        print(f"[ROLLING] Fetch error: {e}")
+        return cache.get("markets", [])
+
+
 async def fetch_market_by_id(market_id: str) -> Optional[dict]:
     try:
         async with httpx.AsyncClient(timeout=15) as client:
@@ -517,20 +622,34 @@ async def llm_analysis_cycle(markets: list) -> list:
     sonnet_count = 0
     SONNET_MAX_PER_CYCLE = 3
 
-    # v4.1 FIX: Gather real news context for top 5 candidates
+    # v4.3 FIX: Research ALL candidates concurrently (was top 5 sequentially)
     news_cache = {}
-    for m in candidates[:5]:
+
+    async def _research_one(m):
         try:
             ctx = await research_agent.gather_market_context(m)
-            news_cache[m["question"]] = ctx
+            return m["question"], ctx
         except Exception:
-            news_cache[m["question"]] = ""
+            return m["question"], ""
+
+    research_results = await asyncio.gather(
+        *[_research_one(m) for m in candidates],
+        return_exceptions=True,
+    )
+    for r in research_results:
+        if isinstance(r, tuple):
+            news_cache[r[0]] = r[1]
+
+    # Pre-fetch open trades once (not per-market)
+    open_trades = await db.get_open_paper_trades()
+    open_market_ids = {t["market_id"] for t in open_trades}
+
+    # v4.3: Throttle LLM calls to avoid rate limits (50/min)
+    llm_call_count = 0
 
     for market in candidates:
         try:
-            # Skip if we already have a position
-            open_trades = await db.get_open_paper_trades()
-            if market["id"] in {t["market_id"] for t in open_trades}:
+            if market["id"] in open_market_ids:
                 continue
 
             vol_profile = {}
@@ -541,6 +660,31 @@ async def llm_analysis_cycle(markets: list) -> list:
 
             # v4.1 FIX: Use real news context (was news_context = "")
             news_context = news_cache.get(market["question"], "")
+
+            # v4.3: Research quality gate — don't waste LLM calls on thin context
+            quality = research_agent.get_research_quality(news_context)
+            if not quality["sufficient"]:
+                try:
+                    await db.save_decision_log({
+                        "market_id": market["id"],
+                        "market_question": market["question"],
+                        "strategy": "LLM_ANALYSIS",
+                        "score": 0,
+                        "decision": "SKIP",
+                        "reason": f"Research quality gate: {quality['reason']} (score={quality['score']}, {quality['char_count']} chars)",
+                        "yes_price": market.get("yes_price", 0),
+                        "direction": "",
+                        "factors": quality,
+                        "created_at": datetime.utcnow().isoformat(),
+                    })
+                except Exception:
+                    pass
+                continue
+
+            # v4.3: Rate limit throttle — max ~40 calls/min to stay under 50/min limit
+            llm_call_count += 1
+            if llm_call_count > 1:
+                await asyncio.sleep(1.5)  # ~40 calls/min
 
             # Run LLM analysis
             result = await analyze_market(
@@ -696,6 +840,17 @@ async def trading_loop():
                 )
                 markets_by_id[m["id"]] = m
 
+            # Fetch rolling 5M/15M crypto markets EVERY loop (speed critical for last-30s edge)
+            try:
+                rolling = await fetch_rolling_crypto_markets()
+                for m in rolling:
+                    if m["id"] not in markets_by_id:
+                        markets.append(m)
+                        markets_by_id[m["id"]] = m
+            except Exception as e:
+                if _loop_count <= 3:
+                    print(f"[ROLLING] Error: {e}")
+
             await backfill_open_trade_markets(markets_by_id)
 
             # Check exits FIRST
@@ -736,13 +891,12 @@ async def trading_loop():
                 arb_scan_signals = verified_arb_signals
             _strategy_debug["arbitrage_signals"] = len(arb_scan_signals)
 
-            # -- Strategy 4: Short-Duration (every 3rd loop) --
+            # -- Strategy 4: Short-Duration (EVERY loop — 5M windows are tight) --
             short_signals = []
-            if _loop_count % SHORT_DUR_EVERY == 0:
-                try:
-                    short_signals = generate_short_duration_signals(markets)
-                except Exception as e:
-                    print(f"[SHORT] Error: {e}")
+            try:
+                short_signals = generate_short_duration_signals(markets)
+            except Exception as e:
+                print(f"[SHORT] Error: {e}")
             _strategy_debug["short_duration_signals"] = len(short_signals)
 
             # -- Strategy 2: Volume Spike (EVERY loop) --
@@ -1238,6 +1392,12 @@ async def api_brain_improvement_history():
 async def api_brain_weights_history():
     """Weight changes extracted from improvement_log."""
     return await db.get_weights_history()
+
+
+@app.get("/api/research/stats")
+async def api_research_stats():
+    """Research agent usage statistics."""
+    return research_agent.get_research_stats()
 
 
 # -- Frontend Serving --

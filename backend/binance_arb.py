@@ -1,12 +1,19 @@
 """
-Binance Momentum Arbitrage â exploits Polymarket's slow repricing on BTC 5-min markets.
+Binance Momentum Arbitrage v5.1 — BTC-focused last-30-second edge exploitation.
 
-Strategy: When Binance shows BTC moved >0.3% since a 5-min window opened,
-but Polymarket odds haven't caught up, buy the correct side.
-These markets resolve based on the same underlying price, so Binance
-is essentially an oracle for Polymarket's binary outcome.
+Core edge: Polymarket's rolling 5M/15M crypto markets resolve based on the same
+underlying price that Binance shows in real-time. But Polymarket odds are SLOW to
+reprice. If BTC moved +0.1% on Binance with 25 seconds left, the "Up" side should
+be ~90%+ but Polymarket might still show 0.60. That's free money.
 
-Called every loop from main.py (speed critical â these windows are short).
+v5.1 CHANGES (user-discovered edge):
+- BTC is PRIMARY target (most liquid on both Binance and Polymarket)
+- Last-30-second entries get MAXIMUM priority (highest win rate)
+- Lowered move threshold for last-30s (even 0.1% is reliable when time is short)
+- All 7 assets supported but BTC gets aggressive parameters
+- Both 5M and 15M timeframes
+
+Called every loop from main.py (speed critical — these windows are short).
 """
 
 import re
@@ -20,36 +27,69 @@ except ImportError:
     def get_binance_status(): return {}
 
 
-# ââ Configuration ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# -- Configuration --
 
-ARB_MOVE_THRESHOLD = 0.0015   # v4.2: 0.15% minimum Binance move (was 0.3% — too restrictive)
-ARB_MAX_POLY_PRICE = 0.88     # Max Polymarket price for our side (12%+ edge required)
-ARB_MIN_SECS_LEFT  = 30       # Don't enter with < 30 seconds remaining
-ARB_MAX_SECS_LEFT  = 240      # Don't enter too early (wait for directional signal)
+# Standard thresholds (>30 seconds remaining)
+ARB_MOVE_THRESHOLD     = 0.0015   # 0.15% minimum Binance move
+ARB_MAX_POLY_PRICE     = 0.88     # Max Polymarket price for our side
+ARB_MIN_EDGE           = 0.05     # 5% minimum edge
 
-# ââ Module State âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# AGGRESSIVE thresholds for last-30-second window (the discovered edge)
+# User confirmed: entering BTC 5M in last 30s is "guaranteed profit"
+LAST30_MOVE_THRESHOLD  = 0.0002   # 0.02% — any detectable Binance move is enough
+LAST30_MAX_POLY_PRICE  = 0.95     # Allow very high entry — resolution is imminent
+LAST30_MIN_EDGE        = 0.01     # 1% edge is enough when resolution is seconds away
 
-_arb_reference_prices = {}   # {market_id: {"ref_price": float, "window_start": datetime}}
+# Timing
+ARB_MIN_SECS_LEFT      = 5        # Enter up to 5 seconds before close
+ARB_MAX_SECS_LEFT      = 120      # Don't enter too early on 5M markets
+ARB_MAX_SECS_LEFT_15M  = 300      # 15M markets: wider window
+
+# BTC priority boost
+BTC_SCORE_BONUS        = 5        # BTC markets get +5 score (most liquid/reliable)
+
+# -- Module State --
+
+_arb_reference_prices = {}   # {market_id: {"ref_price": float, "window_start": datetime, "asset": str}}
 _arb_entered_markets = set()  # Track entered markets to prevent double-entry
 
+# -- Rolling market detection --
 
-# ââ Helpers ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+_ROLLING_SLUG_PATTERN = re.compile(
+    r"(btc|eth|sol|xrp|bnb|doge|hype)-updown-(5|15)m-\d+", re.IGNORECASE
+)
 
-def _is_btc_5min_market(market: dict) -> bool:
-    """Detect BTC 5-minute up/down markets via slug or question text."""
-    slug = market.get("slug", "")
+_ASSET_MAP = {
+    "btc": "BTC", "eth": "ETH", "sol": "SOL", "xrp": "XRP",
+    "bnb": "BNB", "doge": "DOGE", "hype": "HYPE",
+}
+
+
+def _is_rolling_crypto_market(market: dict) -> Optional[dict]:
+    """
+    Detect rolling 5m/15m crypto up/down markets.
+    Returns {"asset": str, "timeframe": int} or None.
+    """
+    slug = market.get("slug", "").lower()
+
+    match = _ROLLING_SLUG_PATTERN.match(slug)
+    if match:
+        asset_key = match.group(1).lower()
+        tf = int(match.group(2))
+        asset = _ASSET_MAP.get(asset_key, asset_key.upper())
+        return {"asset": asset, "timeframe": tf}
+
+    # Fallback: question-based
     question = market.get("question", "").lower()
+    for key, symbol in _ASSET_MAP.items():
+        if key in question and ("5 min" in question or "5-min" in question or "5m" in question):
+            if "up" in question or "down" in question:
+                return {"asset": symbol, "timeframe": 5}
+        if key in question and ("15 min" in question or "15-min" in question or "15m" in question):
+            if "up" in question or "down" in question:
+                return {"asset": symbol, "timeframe": 15}
 
-    # Slug-based detection (most reliable)
-    if "btc" in slug.lower() and ("5m" in slug.lower() or "5min" in slug.lower()):
-        return True
-
-    # Question-based detection
-    if "btc" in question and ("5 min" in question or "5-min" in question or "5min" in question):
-        if "up" in question or "down" in question or "above" in question or "below" in question:
-            return True
-
-    return False
+    return None
 
 
 def _estimate_seconds_remaining(market: dict) -> float:
@@ -68,55 +108,56 @@ def _estimate_seconds_remaining(market: dict) -> float:
         return 9999.0
 
 
-# ââ Main Signal Generator ââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# -- Main Signal Generator --
 
 def generate_arb_signals(markets: list) -> list:
     """
-    Scan markets for BTC 5-min arbitrage opportunities.
+    Scan markets for rolling crypto arbitrage opportunities.
+    BTC is the primary target. Last-30-second entries get maximum priority.
 
     Called EVERY loop from main.py trading_loop() (speed critical).
-
     Returns list of signal dicts ready for maybe_enter_trade().
     """
     signals = []
     now = datetime.utcnow()
 
-    # Safety: Binance feed must be live
-    btc_price = get_price("BTC")
-    if not btc_price or btc_price <= 0:
+    # Find rolling crypto markets — only LIVE ones (secs_left > 0)
+    rolling_markets = []
+    for m in markets:
+        info = _is_rolling_crypto_market(m)
+        if info:
+            secs = _estimate_seconds_remaining(m)
+            if secs > 0:  # Only live (non-expired) markets
+                rolling_markets.append((m, info))
+
+    if not rolling_markets:
         return []
 
-    # Check if price data is fresh (< 10 seconds old)
+    # Check Binance feed health — at minimum BTC must be live
+    btc_price = get_price("BTC")
+    if not btc_price or btc_price <= 0:
+        # No BTC feed = skip entirely (BTC is our primary edge)
+        return []
+
     binance_status = get_binance_status()
-    btc_status = binance_status.get("BTC", {})
-    last_update = btc_status.get("last_update")
-    if last_update:
-        try:
-            if isinstance(last_update, str):
-                last_dt = datetime.fromisoformat(last_update)
-            else:
-                last_dt = last_update
-            if hasattr(last_dt, 'tzinfo') and last_dt.tzinfo:
-                last_dt = last_dt.replace(tzinfo=None)
-            age_seconds = (now - last_dt).total_seconds()
-            if age_seconds > 10:
-                return []  # Stale data
-        except Exception:
-            pass  # If we can't check freshness, proceed cautiously
 
-    # Filter for BTC 5-min markets
-    btc_5min_markets = [m for m in markets if _is_btc_5min_market(m)]
+    for market, info in rolling_markets:
+        asset = info["asset"]
+        timeframe = info["timeframe"]
+        current_price = get_price(asset)
+        if not current_price or current_price <= 0:
+            continue
 
-    for market in btc_5min_markets:
         market_id = market["id"]
 
         # Track new markets with reference price
         if market_id not in _arb_reference_prices:
             _arb_reference_prices[market_id] = {
-                "ref_price": btc_price,
+                "ref_price": current_price,
                 "window_start": now,
+                "asset": asset,
             }
-            continue  # Don't signal on first sight â need to observe movement
+            continue  # Don't signal on first sight -- need to observe movement
 
         ref_data = _arb_reference_prices[market_id]
         ref_price = ref_data["ref_price"]
@@ -125,14 +166,38 @@ def generate_arb_signals(markets: list) -> list:
         if market_id in _arb_entered_markets:
             continue
 
-        # Calculate BTC move since window opened
-        move = (btc_price / ref_price) - 1
+        # Calculate price move since window opened
+        move = (current_price / ref_price) - 1
 
-        # Not enough signal
-        if abs(move) < ARB_MOVE_THRESHOLD:
+        # Check timing window
+        secs_left = _estimate_seconds_remaining(market)
+        max_secs = ARB_MAX_SECS_LEFT_15M if timeframe == 15 else ARB_MAX_SECS_LEFT
+
+        if secs_left < ARB_MIN_SECS_LEFT or secs_left > max_secs:
             continue
 
-        # Determine direction: BTC up -> YES, BTC down -> NO
+        # -- Determine if this is a LAST-30-SECOND entry (the sweet spot) --
+        is_last30 = secs_left <= 30
+        is_btc = asset == "BTC"
+
+        # Use aggressive thresholds for last-30s entries
+        move_threshold = LAST30_MOVE_THRESHOLD if is_last30 else ARB_MOVE_THRESHOLD
+        max_poly = LAST30_MAX_POLY_PRICE if is_last30 else ARB_MAX_POLY_PRICE
+        min_edge = LAST30_MIN_EDGE if is_last30 else ARB_MIN_EDGE
+
+        # Not enough signal
+        if abs(move) < move_threshold:
+            # Debug log for BTC in last 120s (so we can see what's happening)
+            if is_btc and secs_left <= 120:
+                tag = "LAST30" if is_last30 else "STD"
+                print(
+                    f"[ARB-DBG] BTC {timeframe}m [{tag}] move={move:+.5%} "
+                    f"(need {move_threshold:.4%}) {secs_left:.0f}s left "
+                    f"ref=${ref_price:,.2f} now=${current_price:,.2f}"
+                )
+            continue
+
+        # Determine direction: price up -> YES, price down -> NO
         direction = "YES" if move > 0 else "NO"
         yes_price = market.get("yes_price", 0.5)
 
@@ -140,53 +205,80 @@ def generate_arb_signals(markets: list) -> list:
         poly_price = yes_price if direction == "YES" else (1 - yes_price)
 
         # Check if there's still an edge (Polymarket hasn't caught up)
-        if poly_price > ARB_MAX_POLY_PRICE:
-            continue  # Market already repriced â no edge
-
-        # Check timing window
-        secs_left = _estimate_seconds_remaining(market)
-        if secs_left < ARB_MIN_SECS_LEFT or secs_left > ARB_MAX_SECS_LEFT:
+        if poly_price > max_poly:
             continue
 
-        # Calculate edge
-        edge = (0.50 + abs(move) * 50) - poly_price
-        if edge < 0.05:
-            continue  # Need at least 5% edge
+        # Calculate edge: our estimated true probability minus what we're paying
+        # With 25s left and BTC up 0.2%, true probability of "Up" is very high
+        estimated_true_prob = min(0.98, 0.50 + abs(move) * 100)  # More aggressive estimate
+        if is_last30:
+            # Near resolution: if price has moved, it's very unlikely to reverse
+            estimated_true_prob = min(0.98, 0.55 + abs(move) * 150)
 
-        # ââ Score the signal âââââââââââââââââââââââââââââââââââââââââââââ
-        score = 80
+        edge = estimated_true_prob - poly_price
+        if edge < min_edge:
+            continue
+
+        # -- Score the signal --
+        score = 78
+
+        # Move strength
+        if abs(move) > 0.003:
+            score += 8   # Strong move (0.3%+)
         if abs(move) > 0.005:
-            score += 10  # Strong move (0.5%+)
+            score += 5   # Very strong (0.5%+)
         if abs(move) > 0.008:
-            score += 5   # Very strong (0.8%+)
-        if edge > 0.20:
-            score += 5   # Book very slow to reprice
+            score += 3   # Massive (0.8%+)
+
+        # Edge size
+        if edge > 0.15:
+            score += 5   # Big edge
+        if edge > 0.25:
+            score += 3   # Huge edge
+
+        # THE KEY BONUS: Last-30-second entries
+        if is_last30:
+            score += 8   # Maximum edge window — user's discovered sweet spot
+        elif secs_left <= 60:
+            score += 4   # Still good
+        elif secs_left <= 90:
+            score += 2
+
+        # BTC bonus (most liquid, most reliable)
+        if is_btc:
+            score += BTC_SCORE_BONUS
+
         score = min(99, max(75, score))
 
-        # ââ Build signal âââââââââââââââââââââââââââââââââââââââââââââââââ
+        # -- Build signal --
+        tag = "LAST30" if is_last30 else "STD"
         signal = {
             "market_id": market_id,
             "market_question": market.get("question", ""),
             "score": score,
-            "confidence": min(0.95, 0.50 + abs(move) * 50),
+            "confidence": min(0.97, estimated_true_prob),
             "direction": direction,
             "yes_price": yes_price,
             "market_type": "BINANCE_ARB",
             "can_enter": True,
             "entry_reason": (
-                f"ARB: BTC {move:+.2%} from window open "
-                f"(ref ${ref_price:,.0f} -> ${btc_price:,.0f}), "
-                f"Poly {direction}@{poly_price:.2f}, edge={edge:.0%}"
+                f"ARB[{tag}]: {asset} {move:+.3%} "
+                f"(${ref_price:,.2f}->${current_price:,.2f}), "
+                f"{direction}@{poly_price:.2f}, edge={edge:.0%}, "
+                f"{secs_left:.0f}s left, score={score}"
             ),
             "factors_json": {
                 "reference_price": ref_price,
-                "current_price": btc_price,
+                "current_price": current_price,
                 "move_pct": round(move, 6),
                 "polymarket_price": round(poly_price, 4),
                 "edge_pct": round(edge, 4),
+                "estimated_true_prob": round(estimated_true_prob, 4),
                 "seconds_remaining": round(secs_left, 0),
-                "asset": "BTC",
-                "timeframe_minutes": 5,
+                "asset": asset,
+                "timeframe_minutes": timeframe,
+                "is_last30_entry": is_last30,
+                "is_btc": is_btc,
             },
             "created_at": now.isoformat(),
             "clob_token_ids": market.get("clob_token_ids", []),
@@ -195,17 +287,25 @@ def generate_arb_signals(markets: list) -> list:
         }
         signals.append(signal)
 
+        emoji = "***" if (is_last30 and is_btc) else "**" if is_last30 else "*" if is_btc else ""
         print(
-            f"[ARB] Signal: BTC {move:+.2%} | {direction}@{poly_price:.2f} "
-            f"edge={edge:.0%} | secs_left={secs_left:.0f} | "
-            f"'{market.get('question', '')[:40]}'"
+            f"[ARB]{emoji} {tag} {asset} {timeframe}m {move:+.3%} | "
+            f"{direction}@{poly_price:.2f} edge={edge:.0%} | "
+            f"{secs_left:.0f}s left | score={score} | "
+            f"'{market.get('question', '')[:45]}'"
         )
 
-    # ââ Clean up expired markets (older than 6 minutes) ââââââââââââââââââ
+    # Sort: BTC last-30s first, then by score
+    signals.sort(key=lambda s: (
+        s["factors_json"].get("is_btc", False) and s["factors_json"].get("is_last30_entry", False),
+        s["score"],
+    ), reverse=True)
+
+    # Clean up expired markets (older than 20 minutes)
     expired = []
     for mid, data in _arb_reference_prices.items():
         age = (now - data["window_start"]).total_seconds()
-        if age > 360:  # 6 minutes
+        if age > 1200:  # 20 minutes (covers 15M markets)
             expired.append(mid)
     for mid in expired:
         del _arb_reference_prices[mid]
