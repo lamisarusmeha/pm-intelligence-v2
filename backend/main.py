@@ -1,5 +1,5 @@
 """
-PM Intelligence v4.1 — 6-Strategy Self-Learning Trading Agent
+PM Intelligence v4.3 — 7-Strategy Self-Learning Trading Agent
 
 Strategies:
 1. Near-Certainty Grinder — scans for 80-97% likely outcomes
