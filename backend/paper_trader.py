@@ -272,50 +272,83 @@ def _kelly_position_size(portfolio: dict, signal: dict) -> float:
 async def maybe_enter_trade(signal: dict) -> Optional[dict]:
     mt = signal.get("market_type", "?")
     q = signal.get("market_question", "")[:40]
+    now_iso = datetime.utcnow().isoformat()
+
+    async def _log_reject(reason: str):
+        """Log a gate rejection to decision_log."""
+        try:
+            await db.save_decision_log({
+                "market_id": signal.get("market_id", ""),
+                "market_question": signal.get("market_question", ""),
+                "strategy": signal.get("market_type", "UNKNOWN"),
+                "score": signal.get("score", 0),
+                "decision": "GATE_REJECT",
+                "reason": reason,
+                "yes_price": signal.get("yes_price", 0),
+                "direction": signal.get("direction", ""),
+                "factors": json.loads(signal.get("factors_json", "{}")) if isinstance(signal.get("factors_json"), str) else signal.get("factors_json", {}),
+                "created_at": now_iso,
+            })
+        except Exception:
+            pass  # Don't let logging break trading
 
     score = signal.get("score", 0)
     if score < ENTRY_THRESHOLD:
+        reason = f"Score {score} < threshold {ENTRY_THRESHOLD}"
         print(f"[GATE] score {score} < {ENTRY_THRESHOLD} — skip '{q}'")
+        await _log_reject(reason)
         return None
 
     if not signal.get("can_enter", False):
         print(f"[GATE] can_enter=False — skip '{q}'")
+        await _log_reject("can_enter=False — market not eligible")
         return None
 
     open_trades = await db.get_open_paper_trades()
     if len(open_trades) >= MAX_OPEN_TRADES:
+        reason = f"Max open trades reached ({len(open_trades)}/{MAX_OPEN_TRADES})"
         print(f"[GATE] max trades ({len(open_trades)}/{MAX_OPEN_TRADES}) — skip")
+        await _log_reject(reason)
         return None
 
     if signal["market_id"] in {t["market_id"] for t in open_trades}:
-        return None  # Silent — expected for duplicate markets
+        return None  # Silent — expected for duplicate markets (don't log)
 
     portfolio = await db.get_portfolio()
 
     # v4.1 FIX: Circuit breaker applies to ALL strategies (removed ARBITRAGE exemption)
     if _check_circuit_breakers(portfolio):
+        reason = f"Circuit breaker: {_circuit_breaker_reason}"
         print(f"[GATE] CIRCUIT BREAKER: {_circuit_breaker_reason}")
+        await _log_reject(reason)
         return None
 
     cost = _kelly_position_size(portfolio, signal)
     if cost < 1.0:
+        reason = f"Kelly size too small (${cost:.2f})"
         print(f"[GATE] Kelly size too small (${cost:.2f}) for {mt} — skip '{q}'")
+        await _log_reject(reason)
         return None
     if cost > portfolio.get("cash_balance", 0):
+        reason = f"Insufficient cash (need ${cost:.2f}, have ${portfolio.get('cash_balance', 0):.2f})"
         print(f"[GATE] Insufficient cash for ${cost:.2f} — skip")
+        await _log_reject(reason)
         return None
 
     direction = signal.get("direction", "YES")
     market_type = signal.get("market_type", "MOMENTUM")
 
     if direction == "NO" and market_type not in NO_ALLOWED_TYPES:
+        reason = f"NO direction not allowed for {market_type}"
         print(f"[GATE] NO not allowed for {market_type} — skip '{q}'")
+        await _log_reject(reason)
         return None
 
     yes_price = signal.get("yes_price", 0.5)
     entry_price = yes_price if direction == "YES" else (1 - yes_price)
     if entry_price <= 0:
         print(f"[GATE] entry_price <= 0 — skip '{q}'")
+        await _log_reject(f"Entry price <= 0 ({entry_price})")
         return None
 
     # Range market blacklist
@@ -323,12 +356,15 @@ async def maybe_enter_trade(signal: dict) -> Optional[dict]:
     if market_type in ("NEAR_CERTAINTY", "LLM_ANALYSIS"):
         if any(word in question_lower for word in RANGE_BLACKLIST_WORDS):
             print(f"[GATE] RANGE market blacklisted – skip '{q}'")
+            await _log_reject("Range market blacklisted (contains range keywords)")
             return None
 
     # Extreme price guard
     max_price = 0.93 if market_type == "NEAR_CERTAINTY" else 0.95
     if entry_price > max_price or entry_price < 0.05:
+        reason = f"Extreme price {entry_price:.4f} (allowed: 0.05-{max_price})"
         print(f"[GATE] EXTREME price {entry_price:.4f} (max={max_price}) – skip '{q}'")
+        await _log_reject(reason)
         return None
 
     shares = round(cost / entry_price, 4)
@@ -389,6 +425,23 @@ async def maybe_enter_trade(signal: dict) -> Optional[dict]:
         )
     except Exception as e:
         print(f"[MEMORY] Store reasoning failed: {e}")
+
+    # ── LOG ENTRY DECISION ──────────────────────────────────────────────
+    try:
+        await db.save_decision_log({
+            "market_id": signal["market_id"],
+            "market_question": signal["market_question"],
+            "strategy": market_type,
+            "score": score,
+            "decision": "ENTER",
+            "reason": signal.get("entry_reason", f"All gates passed, Kelly=${cost:.2f}"),
+            "yes_price": yes_price,
+            "direction": direction,
+            "factors": json.loads(signal.get("factors_json", "{}")) if isinstance(signal.get("factors_json"), str) else signal.get("factors_json", {}),
+            "created_at": now,
+        })
+    except Exception:
+        pass
 
     print(f"[TRADE] {market_type} {direction} "
           f"'{signal['market_question'][:48]}' "

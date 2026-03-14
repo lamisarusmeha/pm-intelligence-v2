@@ -128,6 +128,61 @@ async def init_db():
                 size REAL, price REAL, win_rate REAL,
                 timestamp TEXT, created_at TEXT
             );
+
+            -- ── Decision Log — tracks EVERY market encounter ────────────────
+            CREATE TABLE IF NOT EXISTS decision_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_id TEXT,
+                market_question TEXT,
+                strategy TEXT,
+                score REAL,
+                decision TEXT,
+                reason TEXT,
+                yes_price REAL,
+                direction TEXT,
+                factors_json TEXT DEFAULT '{}',
+                created_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_decision_log_created ON decision_log(created_at);
+            CREATE INDEX IF NOT EXISTS idx_decision_log_decision ON decision_log(decision);
+
+            -- ── Trade Memory — full audit trail per trade ────────────────────
+            CREATE TABLE IF NOT EXISTS trade_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_id INTEGER,
+                market_question TEXT,
+                direction TEXT,
+                entry_reasoning TEXT,
+                exit_outcome TEXT,
+                lesson TEXT,
+                category TEXT,
+                pnl REAL,
+                won INTEGER DEFAULT 0,
+                created_at TEXT,
+                closed_at TEXT
+            );
+
+            -- ── Agent Lessons — curated insights extracted by LLM ────────────
+            CREATE TABLE IF NOT EXISTS agent_lessons (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lesson TEXT,
+                source_trade_id INTEGER,
+                category TEXT,
+                outcome TEXT,
+                times_referenced INTEGER DEFAULT 0,
+                created_at TEXT
+            );
+
+            -- ── Category Stats — per-category win rates ──────────────────────
+            CREATE TABLE IF NOT EXISTS category_stats (
+                category TEXT PRIMARY KEY,
+                total_trades INTEGER DEFAULT 0,
+                wins INTEGER DEFAULT 0,
+                losses INTEGER DEFAULT 0,
+                total_pnl REAL DEFAULT 0,
+                avg_pnl REAL DEFAULT 0,
+                updated_at TEXT
+            );
         """)
         # Leverage trading tables
         await db.executescript("""
@@ -749,3 +804,253 @@ async def set_signal_weights(weights: dict):
                 ON CONFLICT(factor) DO UPDATE SET weight = excluded.weight
             """, (factor, weight))
         await db.commit()
+
+
+# ── Decision Log CRUD ────────────────────────────────────────────────────────
+
+async def save_decision_log(entry: dict):
+    """Log a market decision (ENTER, SKIP, GATE_REJECT, STRATEGY_CYCLE)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO decision_log
+                (market_id, market_question, strategy, score, decision, reason,
+                 yes_price, direction, factors_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            entry.get("market_id", ""),
+            entry.get("market_question", ""),
+            entry.get("strategy", ""),
+            entry.get("score", 0),
+            entry.get("decision", "SKIP"),
+            entry.get("reason", ""),
+            entry.get("yes_price", 0),
+            entry.get("direction", ""),
+            json.dumps(entry.get("factors", {})),
+            entry.get("created_at", datetime.utcnow().isoformat()),
+        ))
+        # Auto-prune to last 5000 rows
+        await db.execute("""
+            DELETE FROM decision_log WHERE id NOT IN (
+                SELECT id FROM decision_log ORDER BY id DESC LIMIT 5000
+            )
+        """)
+        await db.commit()
+
+
+async def get_decision_log(limit: int = 100, offset: int = 0,
+                           decision_filter: str = None,
+                           strategy_filter: str = None) -> list:
+    """Paginated decision log with optional filters."""
+    query = "SELECT * FROM decision_log WHERE 1=1"
+    params = []
+    if decision_filter:
+        query += " AND decision = ?"
+        params.append(decision_filter)
+    if strategy_filter:
+        query += " AND strategy = ?"
+        params.append(strategy_filter)
+    query += " ORDER BY id DESC LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(query, params) as c:
+            rows = await c.fetchall()
+    result = []
+    for r in rows:
+        d = dict(r)
+        d["factors"] = json.loads(d.get("factors_json") or "{}")
+        result.append(d)
+    return result
+
+
+async def get_decision_stats() -> dict:
+    """Aggregate decision counts by type and strategy."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        # By decision type
+        async with db.execute("""
+            SELECT decision, COUNT(*) as count FROM decision_log GROUP BY decision
+        """) as c:
+            by_decision = {r["decision"]: r["count"] for r in await c.fetchall()}
+        # By strategy
+        async with db.execute("""
+            SELECT strategy, COUNT(*) as count FROM decision_log GROUP BY strategy
+        """) as c:
+            by_strategy = {r["strategy"]: r["count"] for r in await c.fetchall()}
+        # Total
+        async with db.execute("SELECT COUNT(*) as total FROM decision_log") as c:
+            total = (await c.fetchone())["total"]
+    return {"total": total, "by_decision": by_decision, "by_strategy": by_strategy}
+
+
+# ── Brain Export/Import helpers ──────────────────────────────────────────────
+
+async def export_brain() -> dict:
+    """Export all learning state as a JSON-serializable dict."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        data = {}
+        for table in ["agent_lessons", "trade_memory", "category_stats",
+                       "signal_weights", "signal_performance", "strategy_params",
+                       "improvement_log", "trade_explanations", "decision_log"]:
+            try:
+                async with db.execute(f"SELECT * FROM {table}") as c:
+                    data[table] = [dict(r) for r in await c.fetchall()]
+            except Exception:
+                data[table] = []
+        # Also include portfolio stats
+        async with db.execute("SELECT * FROM portfolio WHERE id=1") as c:
+            row = await c.fetchone()
+            data["portfolio"] = dict(row) if row else {}
+        # Paper trades
+        async with db.execute("SELECT * FROM paper_trades ORDER BY id DESC LIMIT 500") as c:
+            data["paper_trades"] = [dict(r) for r in await c.fetchall()]
+    return data
+
+
+async def import_brain(data: dict):
+    """Restore learning state from exported JSON."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Restore agent_lessons
+        for lesson in data.get("agent_lessons", []):
+            await db.execute("""
+                INSERT OR IGNORE INTO agent_lessons
+                    (lesson, source_trade_id, category, outcome, times_referenced, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (lesson.get("lesson",""), lesson.get("source_trade_id"),
+                  lesson.get("category",""), lesson.get("outcome",""),
+                  lesson.get("times_referenced",0), lesson.get("created_at","")))
+        # Restore trade_memory
+        for mem in data.get("trade_memory", []):
+            await db.execute("""
+                INSERT OR IGNORE INTO trade_memory
+                    (trade_id, market_question, direction, entry_reasoning, exit_outcome,
+                     lesson, category, pnl, won, created_at, closed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (mem.get("trade_id"), mem.get("market_question",""),
+                  mem.get("direction",""), mem.get("entry_reasoning",""),
+                  mem.get("exit_outcome",""), mem.get("lesson",""),
+                  mem.get("category",""), mem.get("pnl",0), mem.get("won",0),
+                  mem.get("created_at",""), mem.get("closed_at","")))
+        # Restore signal_weights
+        for sw in data.get("signal_weights", []):
+            await db.execute("""
+                INSERT OR REPLACE INTO signal_weights (factor, weight)
+                VALUES (?, ?)
+            """, (sw.get("factor",""), sw.get("weight",1.0)))
+        # Restore strategy_params
+        for sp in data.get("strategy_params", []):
+            await db.execute("""
+                INSERT OR REPLACE INTO strategy_params (param_name, param_value, updated_at)
+                VALUES (?, ?, ?)
+            """, (sp.get("param_name",""), sp.get("param_value",""), sp.get("updated_at","")))
+        # Restore improvement_log
+        for il in data.get("improvement_log", []):
+            await db.execute("""
+                INSERT OR IGNORE INTO improvement_log
+                    (overall_win_rate, gap_to_target, stats_json, changes_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (il.get("overall_win_rate",0), il.get("gap_to_target",0),
+                  il.get("stats_json","{}"), il.get("changes_json","{}"),
+                  il.get("created_at","")))
+        # Restore category_stats
+        for cs in data.get("category_stats", []):
+            await db.execute("""
+                INSERT OR REPLACE INTO category_stats
+                    (category, total_trades, wins, losses, total_pnl, avg_pnl, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (cs.get("category",""), cs.get("total_trades",0), cs.get("wins",0),
+                  cs.get("losses",0), cs.get("total_pnl",0), cs.get("avg_pnl",0),
+                  cs.get("updated_at","")))
+        await db.commit()
+
+
+# ── Brain query helpers ──────────────────────────────────────────────────────
+
+async def get_all_lessons(limit: int = 200) -> list:
+    """Get all agent lessons sorted by times_referenced."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM agent_lessons ORDER BY times_referenced DESC LIMIT ?", (limit,)
+        ) as c:
+            rows = await c.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def get_trade_timeline(limit: int = 100) -> list:
+    """Get trades joined with explanations and memory for full reasoning chain."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT pt.*, te.entry_explanation, te.exit_explanation, te.lesson as te_lesson,
+                   te.factors_json as te_factors, te.score as te_score,
+                   tm.entry_reasoning, tm.exit_outcome, tm.lesson as tm_lesson,
+                   tm.category as tm_category
+            FROM paper_trades pt
+            LEFT JOIN trade_explanations te ON te.trade_id = pt.id
+            LEFT JOIN trade_memory tm ON tm.trade_id = pt.id
+            ORDER BY pt.id DESC LIMIT ?
+        """, (limit,)) as c:
+            rows = await c.fetchall()
+    result = []
+    for r in rows:
+        d = dict(r)
+        d["te_factors_parsed"] = json.loads(d.get("te_factors") or "{}")
+        result.append(d)
+    return result
+
+
+async def get_improvement_history(limit: int = 50) -> list:
+    """Get all improvement_log entries with parsed JSON."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM improvement_log ORDER BY id DESC LIMIT ?", (limit,)
+        ) as c:
+            rows = await c.fetchall()
+    result = []
+    for r in rows:
+        d = dict(r)
+        d["stats"] = json.loads(d.get("stats_json") or "{}")
+        d["changes"] = json.loads(d.get("changes_json") or "{}")
+        result.append(d)
+    return result
+
+
+async def get_weights_history() -> list:
+    """Extract weight changes from improvement_log."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT changes_json, created_at FROM improvement_log ORDER BY id ASC"
+        ) as c:
+            rows = await c.fetchall()
+    history = []
+    for r in rows:
+        changes = json.loads(r["changes_json"] or "{}")
+        weight_changes = {k: v for k, v in changes.items() if "weight" in k.lower() or "signal" in k.lower()}
+        if weight_changes:
+            history.append({"changes": weight_changes, "created_at": r["created_at"]})
+    return history
+
+
+async def get_category_stats() -> list:
+    """Get all category performance stats."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM category_stats ORDER BY total_trades DESC"
+        ) as c:
+            rows = await c.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def get_strategy_params() -> list:
+    """Get all current strategy parameters."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM strategy_params ORDER BY param_name") as c:
+            rows = await c.fetchall()
+    return [dict(r) for r in rows]
