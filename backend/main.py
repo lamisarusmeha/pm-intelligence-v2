@@ -518,14 +518,13 @@ async def llm_analysis_cycle(markets: list) -> list:
     SONNET_MAX_PER_CYCLE = 3
 
     # v4.1 FIX: Gather real news context for top 5 candidates
-    top_questions = [m["question"] for m in candidates[:5]]
     news_cache = {}
-    for q in top_questions:
+    for m in candidates[:5]:
         try:
-            ctx = await research_agent.gather_market_context(q)
-            news_cache[q] = ctx
+            ctx = await research_agent.gather_market_context(m)
+            news_cache[m["question"]] = ctx
         except Exception:
-            news_cache[q] = ""
+            news_cache[m["question"]] = ""
 
     for market in candidates:
         try:
@@ -950,7 +949,42 @@ async def api_portfolio():
 
 @app.get("/api/trades")
 async def api_trades():
-    return await db.get_all_paper_trades(200)
+    from paper_trader import (
+        NEAR_CERTAINTY_HOLD_HOURS, VOLUME_SPIKE_TP, VOLUME_SPIKE_SL,
+        VOLUME_SPIKE_HOLD_HOURS, BINANCE_ARB_HOLD_HOURS,
+        SHORT_DURATION_HOLD_HOURS, ARBITRAGE_TP, ARBITRAGE_SL,
+        ARBITRAGE_HOLD_HOURS, LLM_ANALYSIS_TP, LLM_ANALYSIS_SL,
+        LLM_ANALYSIS_HOLD_HOURS, COPY_TRADE_TP, COPY_TRADE_SL,
+        COPY_TRADE_HOLD_HOURS, BUY_NO_EARLY_TP, BUY_NO_EARLY_SL,
+        BUY_NO_EARLY_HOLD_HOURS, LOCK_IN_TP, LOCK_IN_SL,
+        LOCK_IN_HOLD_HOURS, MOMENTUM_TP, MOMENTUM_SL,
+        MOMENTUM_HOLD_HOURS, PCT_STOP_LOSS,
+    )
+    EXIT_PARAMS = {
+        "NEAR_CERTAINTY":  (None, None, NEAR_CERTAINTY_HOLD_HOURS),
+        "VOLUME_SPIKE":    (VOLUME_SPIKE_TP, VOLUME_SPIKE_SL, VOLUME_SPIKE_HOLD_HOURS),
+        "BINANCE_ARB":     (None, None, BINANCE_ARB_HOLD_HOURS),
+        "SHORT_DURATION":  (None, None, SHORT_DURATION_HOLD_HOURS),
+        "ARBITRAGE":       (ARBITRAGE_TP, ARBITRAGE_SL, ARBITRAGE_HOLD_HOURS),
+        "LLM_ANALYSIS":    (LLM_ANALYSIS_TP, LLM_ANALYSIS_SL, LLM_ANALYSIS_HOLD_HOURS),
+        "COPY_TRADE":      (COPY_TRADE_TP, COPY_TRADE_SL, COPY_TRADE_HOLD_HOURS),
+        "BUY_NO_EARLY":    (BUY_NO_EARLY_TP, BUY_NO_EARLY_SL, BUY_NO_EARLY_HOLD_HOURS),
+        "LOCK_IN":         (LOCK_IN_TP, LOCK_IN_SL, LOCK_IN_HOLD_HOURS),
+        "MOMENTUM":        (MOMENTUM_TP, MOMENTUM_SL, MOMENTUM_HOLD_HOURS),
+    }
+    trades = await db.get_all_paper_trades(200)
+    for t in trades:
+        mt = t.get("market_type", "")
+        entry = t.get("entry_price", 0)
+        tp_d, sl_d, hold = EXIT_PARAMS.get(mt, (MOMENTUM_TP, MOMENTUM_SL, MOMENTUM_HOLD_HOURS))
+        t["tp_price"] = round(entry + tp_d, 4) if tp_d else None
+        t["sl_price"] = round(entry - sl_d, 4) if sl_d else None
+        # For pct-based stop loss (NEAR_CERTAINTY etc), show the pct stop
+        pct_sl = PCT_STOP_LOSS.get(mt)
+        if t["sl_price"] is None and pct_sl and entry > 0:
+            t["sl_price"] = round(entry * (1 - pct_sl), 4)
+        t["max_hold_hours"] = hold
+    return trades
 
 
 @app.get("/api/signals")

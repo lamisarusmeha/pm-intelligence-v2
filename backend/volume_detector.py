@@ -15,7 +15,9 @@ from datetime import datetime, timedelta
 from typing import Optional
 from pathlib import Path
 
-DB_PATH = Path(os.getenv("DB_PATH", "/app/pm_trading.db"))
+# Use the same DB path as database.py — never diverge
+import database as _db_module
+DB_PATH = _db_module.DB_PATH
 
 
 async def _ensure_tables():

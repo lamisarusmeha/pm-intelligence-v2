@@ -118,7 +118,7 @@ LLM_ANALYSIS_HOLD_HOURS = 8.0
 
 # Shared constants
 ENTRY_THRESHOLD = 40
-MAX_OPEN_TRADES = 10
+MAX_OPEN_TRADES = 100
 BASE_RISK_PCT = 0.005
 LEARN_RATE = 0.20
 
@@ -314,8 +314,8 @@ async def maybe_enter_trade(signal: dict) -> Optional[dict]:
     if signal["market_id"] in {t["market_id"] for t in open_trades}:
         return None  # Silent — expected for duplicate markets (don't log)
 
-    # Per-strategy concentration limit — max 5 open trades from same strategy
-    MAX_PER_STRATEGY_OPEN = 5
+    # Per-strategy concentration limit — max 20 open trades from same strategy
+    MAX_PER_STRATEGY_OPEN = 20
     same_strategy = [t for t in open_trades if t.get("market_type") == mt]
     if len(same_strategy) >= MAX_PER_STRATEGY_OPEN:
         reason = f"Strategy concentration limit ({len(same_strategy)}/{MAX_PER_STRATEGY_OPEN} {mt})"
@@ -422,15 +422,21 @@ async def maybe_enter_trade(signal: dict) -> Optional[dict]:
 
         await memory_system.store_trade_reasoning(
             trade_id=trade_id,
+            market_id=signal.get("market_id", ""),
             market_question=signal["market_question"],
+            category=signal.get("category", ""),
             direction=direction,
+            action="ENTER",
             entry_price=entry_price,
             confidence=signal.get("confidence", 0),
             estimated_probability=factors.get("estimated_probability", 0.5),
             edge=factors.get("edge", 0),
             reasoning=factors.get("reasoning", signal.get("entry_reason", "")),
-            model=factors.get("model", market_type),
-            category=signal.get("category", ""),
+            key_evidence=factors.get("key_evidence", []),
+            risk_factors=factors.get("risk_factors", []),
+            had_volume_spike=factors.get("volume_spike", False),
+            model_used=factors.get("model", market_type),
+            tokens_used=factors.get("tokens_used", 0),
         )
     except Exception as e:
         print(f"[MEMORY] Store reasoning failed: {e}")

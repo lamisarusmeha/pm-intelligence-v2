@@ -146,42 +146,56 @@ async def init_db():
             CREATE INDEX IF NOT EXISTS idx_decision_log_created ON decision_log(created_at);
             CREATE INDEX IF NOT EXISTS idx_decision_log_decision ON decision_log(decision);
 
-            -- ── Trade Memory — full audit trail per trade ────────────────────
+            -- ── Trade Memory — schema owned by memory_system.py ──────────────
+            -- DO NOT modify here — memory_system.init_memory() is the source of truth
             CREATE TABLE IF NOT EXISTS trade_memory (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 trade_id INTEGER,
+                market_id TEXT,
                 market_question TEXT,
-                direction TEXT,
-                entry_reasoning TEXT,
-                exit_outcome TEXT,
-                lesson TEXT,
                 category TEXT,
+                direction TEXT,
+                action TEXT,
+                entry_price REAL,
+                exit_price REAL,
                 pnl REAL,
-                won INTEGER DEFAULT 0,
+                outcome TEXT,
+                confidence REAL,
+                estimated_probability REAL,
+                edge REAL,
+                reasoning TEXT,
+                key_evidence TEXT,
+                risk_factors TEXT,
+                lesson TEXT,
+                volume_spike INTEGER DEFAULT 0,
+                model_used TEXT,
+                tokens_used INTEGER DEFAULT 0,
                 created_at TEXT,
-                closed_at TEXT
+                resolved_at TEXT
             );
 
-            -- ── Agent Lessons — curated insights extracted by LLM ────────────
+            -- ── Agent Lessons — schema owned by memory_system.py ─────────────
             CREATE TABLE IF NOT EXISTS agent_lessons (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                lesson TEXT,
-                source_trade_id INTEGER,
+                lesson TEXT NOT NULL,
                 category TEXT,
+                market_type TEXT,
                 outcome TEXT,
+                importance REAL DEFAULT 1.0,
                 times_referenced INTEGER DEFAULT 0,
-                created_at TEXT
+                created_at TEXT NOT NULL
             );
 
-            -- ── Category Stats — per-category win rates ──────────────────────
+            -- ── Category Stats — schema owned by memory_system.py ────────────
             CREATE TABLE IF NOT EXISTS category_stats (
                 category TEXT PRIMARY KEY,
                 total_trades INTEGER DEFAULT 0,
                 wins INTEGER DEFAULT 0,
                 losses INTEGER DEFAULT 0,
                 total_pnl REAL DEFAULT 0,
-                avg_pnl REAL DEFAULT 0,
-                updated_at TEXT
+                avg_confidence REAL DEFAULT 0,
+                avg_edge REAL DEFAULT 0,
+                last_updated TEXT
             );
         """)
         # Leverage trading tables

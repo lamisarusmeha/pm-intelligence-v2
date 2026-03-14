@@ -21,8 +21,8 @@ logger = logging.getLogger(__name__)
 # -- Configuration --
 
 WIN_RATE_TARGET     = 0.80   # 80% overall win rate goal
-RETRAIN_EVERY       = 20     # full re-evaluation after every N closed trades
-MIN_SAMPLE_SIZE     = 5      # minimum trades before adjusting a strategy
+RETRAIN_EVERY       = 5      # full re-evaluation after every N closed trades (was 20 — learn faster)
+MIN_SAMPLE_SIZE     = 3      # minimum trades before adjusting a strategy (was 5 — adapt sooner)
 DISABLE_THRESHOLD   = 0.25   # disable strategy if WR < 25% with >= MIN_SAMPLE_SIZE
 
 # v4.1 FIX: Per-strategy threshold bounds for ALL 9 strategy types (was only 4)
