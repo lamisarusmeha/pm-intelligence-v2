@@ -278,22 +278,23 @@ def generate_short_duration_signals(markets: list) -> list:
                     elif "down" in question_lower and binance_dir == "UP":
                         binance_confirms = True
 
-            # V4.0: REQUIRE Binance confirmation â skip if unconfirmed
-            # This eliminates wrong-direction entries that caused -$95 and -$97 losses
-            if not binance_confirms:
-                if binance_dir is not None:
-                    # Binance actively disagrees â definitely skip
-                    print(
-                        f"[SHORT] SKIP: {asset} {tf}m {direction}@{entry_price:.2f} â "
-                        f"Binance says {binance_dir}, trade says {direction}"
-                    )
+            # V4.2: Binance confirmation is a BOOST, not a gate
+            # If Binance actively DISAGREES, still skip (safety)
+            # If Binance is flat/silent (None), allow the trade through
+            if not binance_confirms and binance_dir is not None:
+                # Binance actively disagrees -- skip
+                print(
+                    f"[SHORT] SKIP: {asset} {tf}m {direction}@{entry_price:.2f} -- "
+                    f"Binance says {binance_dir}, trade says {direction}"
+                )
                 continue
 
             # Score calculation
             score = int(70 + (entry_price - 0.75) * 100)
 
-            # Binance confirmation bonus (always confirmed at this point)
-            score += 8
+            # Binance confirmation bonus
+            if binance_confirms:
+                score += 8
 
             # Time pressure bonus (closer to expiry = more certain)
             if secs_left < 30:

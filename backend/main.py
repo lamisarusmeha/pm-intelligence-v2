@@ -46,6 +46,7 @@ from volume_spike_trader import generate_spike_signals
 from binance_arb import generate_arb_signals
 from short_duration_trader import generate_short_duration_signals
 from arbitrage_scanner import scan_arbitrage_opportunities, _verify_direction_haiku
+from signal_engine import generate_signals as generate_signal_engine_signals
 from binance_feed import (
     binance_websocket_loop,
     binance_prices,
@@ -101,6 +102,7 @@ LOOP_SLEEP     = 3
 GRINDER_EVERY  = 15    # v4.1 FIX: was 20 (~45s now)
 LLM_EVERY      = 20    # v4.1 FIX: was 30 (~60s now)
 SHORT_DUR_EVERY = 3    # Run short-duration check every 3rd loop (~9s)
+SIGNAL_ENGINE_EVERY = 20  # v4.2: Run signal engine (COPY_TRADE/LOCK_IN/BUY_NO_EARLY) every 20 loops
 
 # Global state
 active_connections: Set[WebSocket] = set()
@@ -112,6 +114,7 @@ _strategy_debug = {
     "grinder_signals": 0,
     "short_duration_signals": 0,
     "llm_signals": 0,
+    "signal_engine_signals": 0,
     "arbitrage_signals": 0,
     "total_entered": 0,
     "trades_closed_this_session": 0,
@@ -484,15 +487,15 @@ async def llm_analysis_cycle(markets: list) -> list:
         and m.get("liquidity", 0) > 5000
     ]
     mid_range.sort(key=lambda m: (-m.get("volume24hr", 0), _days_left(m.get("end_date", ""))))
-    # v4.1 FIX: 10 candidates (was 15)
-    candidates = mid_range[:10]
+    # v4.2 FIX: 25 candidates (was 10) — more markets = more opportunities
+    candidates = mid_range[:25]
 
     # If not enough mid-range, add some high-volume markets
-    if len(candidates) < 5:
+    if len(candidates) < 10:
         seen_ids = {m["id"] for m in candidates}
         extras = [m for m in markets if m["id"] not in seen_ids and m.get("volume24hr", 0) > 10000]
         extras.sort(key=lambda m: -m.get("volume24hr", 0))
-        candidates.extend(extras[:10 - len(candidates)])
+        candidates.extend(extras[:25 - len(candidates)])
 
     portfolio = await db.get_portfolio()
     lessons = []
@@ -549,6 +552,22 @@ async def llm_analysis_cycle(markets: list) -> list:
             )
 
             if not result or result.get("action") == "SKIP":
+                # Log LLM SKIP decision
+                try:
+                    await db.save_decision_log({
+                        "market_id": market["id"],
+                        "market_question": market["question"],
+                        "strategy": "LLM_ANALYSIS",
+                        "score": 0,
+                        "decision": "SKIP",
+                        "reason": f"LLM returned SKIP: {(result or {}).get('reasoning', 'no analysis')[:200]}",
+                        "yes_price": market.get("yes_price", 0),
+                        "direction": "",
+                        "factors": {"reasoning": (result or {}).get("reasoning", ""), "model": (result or {}).get("model", "")},
+                        "created_at": datetime.utcnow().isoformat(),
+                    })
+                except Exception:
+                    pass
                 continue
 
             action = result["action"]
@@ -556,6 +575,22 @@ async def llm_analysis_cycle(markets: list) -> list:
             confidence = result.get("confidence", 0)
 
             if edge < 0.05 or confidence < 0.4:
+                # Log low-edge/confidence skip
+                try:
+                    await db.save_decision_log({
+                        "market_id": market["id"],
+                        "market_question": market["question"],
+                        "strategy": "LLM_ANALYSIS",
+                        "score": int(60 + edge * 200 + confidence * 20),
+                        "decision": "SKIP",
+                        "reason": f"Below thresholds: edge={edge:.3f} (min 0.05), conf={confidence:.3f} (min 0.4)",
+                        "yes_price": market.get("yes_price", 0),
+                        "direction": "YES" if action == "BUY_YES" else "NO",
+                        "factors": {"edge": edge, "confidence": confidence, "reasoning": result.get("reasoning", "")},
+                        "created_at": datetime.utcnow().isoformat(),
+                    })
+                except Exception:
+                    pass
                 continue
 
             # v4.1: Track Sonnet usage for rate limiting
@@ -731,11 +766,19 @@ async def trading_loop():
                     print(f"[LLM] Cycle error: {e}")
             _strategy_debug["llm_signals"] = len(llm_signals)
 
+            # -- Strategy 7: Signal Engine — COPY_TRADE/LOCK_IN/BUY_NO_EARLY (every 20th loop) --
+            se_signals = []
+            if _loop_count % SIGNAL_ENGINE_EVERY == 0:
+                try:
+                    se_signals = await generate_signal_engine_signals(markets)
+                except Exception as e:
+                    print(f"[SIG_ENGINE] Error: {e}")
+            _strategy_debug["signal_engine_signals"] = len(se_signals)
+
             # -- Enter trades from ALL strategies --
-            # v4.1 FIX: Signal priority reordered — LLM first (highest conviction),
-            # then grinder, spike, short, arb last (lowest conviction)
+            # v4.2 FIX: Added signal engine signals (COPY_TRADE/LOCK_IN/BUY_NO_EARLY)
             all_signals = (
-                llm_signals + grinder_signals + spike_signals +
+                llm_signals + se_signals + grinder_signals + spike_signals +
                 short_signals + arb_signals + arb_scan_signals
             )
             entered = 0
@@ -767,8 +810,8 @@ async def trading_loop():
                 cb_status = "PAUSED" if risk.get("circuit_breaker_active") else "OK"
 
                 print(
-                    f"[v4.1] #{_loop_count}: {len(markets)} mkts | "
-                    f"LLM={len(llm_signals)} GRIND={len(grinder_signals)} "
+                    f"[v4.2] #{_loop_count}: {len(markets)} mkts | "
+                    f"LLM={len(llm_signals)} SE={len(se_signals)} GRIND={len(grinder_signals)} "
                     f"SPIKE={len(spike_signals)} SHORT={len(short_signals)} "
                     f"ARB={len(arb_signals)} ARBS={len(arb_scan_signals)} | "
                     f"entered={entered} | BTC=${btc_price:,.0f} | "
@@ -1078,6 +1121,67 @@ async def api_paths():
         "cwd": os.getcwd(),
         "file": __file__,
     }
+
+
+# -- Brain API Endpoints --
+
+@app.get("/api/brain/export")
+async def api_brain_export():
+    """Download full learning state as JSON."""
+    data = await db.export_brain()
+    return JSONResponse(data, headers={
+        "Content-Disposition": "attachment; filename=brain_export.json"
+    })
+
+
+@app.post("/api/brain/import")
+async def api_brain_import(request: Request):
+    """Upload JSON to restore memory tables."""
+    try:
+        data = await request.json()
+        await db.import_brain(data)
+        return {"status": "ok", "msg": "Brain imported successfully"}
+    except Exception as e:
+        return JSONResponse({"status": "error", "msg": str(e)}, status_code=400)
+
+
+@app.get("/api/brain/decisions")
+async def api_brain_decisions(limit: int = 100, offset: int = 0,
+                               decision: str = None, strategy: str = None):
+    """Paginated decision log with filters."""
+    return await db.get_decision_log(limit=limit, offset=offset,
+                                      decision_filter=decision,
+                                      strategy_filter=strategy)
+
+
+@app.get("/api/brain/decisions/stats")
+async def api_brain_decision_stats():
+    """Aggregate decision counts by type/strategy."""
+    return await db.get_decision_stats()
+
+
+@app.get("/api/brain/lessons")
+async def api_brain_lessons():
+    """All agent lessons sorted by times_referenced."""
+    return await db.get_all_lessons()
+
+
+@app.get("/api/brain/timeline")
+async def api_brain_timeline(limit: int = 100):
+    """Trades joined with trade_memory + trade_explanations (full reasoning chain)."""
+    return await db.get_trade_timeline(limit=limit)
+
+
+@app.get("/api/brain/improvement-history")
+async def api_brain_improvement_history():
+    """All improvement_log entries with parsed JSON."""
+    return await db.get_improvement_history()
+
+
+@app.get("/api/brain/weights-history")
+async def api_brain_weights_history():
+    """Weight changes extracted from improvement_log."""
+    return await db.get_weights_history()
 
 
 # -- Frontend Serving --

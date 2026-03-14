@@ -22,7 +22,7 @@ except ImportError:
 
 # ââ Configuration ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
-ARB_MOVE_THRESHOLD = 0.003    # 0.3% minimum Binance move to trigger entry
+ARB_MOVE_THRESHOLD = 0.0015   # v4.2: 0.15% minimum Binance move (was 0.3% — too restrictive)
 ARB_MAX_POLY_PRICE = 0.88     # Max Polymarket price for our side (12%+ edge required)
 ARB_MIN_SECS_LEFT  = 30       # Don't enter with < 30 seconds remaining
 ARB_MAX_SECS_LEFT  = 240      # Don't enter too early (wait for directional signal)

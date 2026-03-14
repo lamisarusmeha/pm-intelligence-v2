@@ -199,14 +199,14 @@ async def generate_near_certainty_signals(markets: list, binance_prices: dict) -
             if days > 30 or days < 0:
                 continue
 
-            # Filter 2: Price in near-certainty zone (0.80-0.97 for favored side)
+            # Filter 2: Price in near-certainty zone (v4.2: 0.75-0.97, was 0.80-0.97)
             yes_price = market.get("yes_price", 0.5)
             no_price = 1 - yes_price
 
-            if 0.80 <= yes_price <= 0.97:
+            if 0.75 <= yes_price <= 0.97:
                 direction = "YES"
                 entry_price = yes_price
-            elif 0.80 <= no_price <= 0.97:
+            elif 0.75 <= no_price <= 0.97:
                 direction = "NO"
                 entry_price = no_price
             else:
