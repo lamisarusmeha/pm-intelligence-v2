@@ -791,7 +791,10 @@ async def trading_loop():
                 short_signals + arb_signals + arb_scan_signals
             )
             entered = 0
+            MAX_ENTRIES_PER_LOOP = 3  # Don't flood — max 3 new trades per cycle
             for sig in all_signals:
+                if entered >= MAX_ENTRIES_PER_LOOP:
+                    break
                 trade = await maybe_enter_trade(sig)
                 if trade:
                     entered += 1
