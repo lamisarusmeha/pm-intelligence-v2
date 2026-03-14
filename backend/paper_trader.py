@@ -314,6 +314,15 @@ async def maybe_enter_trade(signal: dict) -> Optional[dict]:
     if signal["market_id"] in {t["market_id"] for t in open_trades}:
         return None  # Silent — expected for duplicate markets (don't log)
 
+    # Per-strategy concentration limit — max 5 open trades from same strategy
+    MAX_PER_STRATEGY_OPEN = 5
+    same_strategy = [t for t in open_trades if t.get("market_type") == mt]
+    if len(same_strategy) >= MAX_PER_STRATEGY_OPEN:
+        reason = f"Strategy concentration limit ({len(same_strategy)}/{MAX_PER_STRATEGY_OPEN} {mt})"
+        print(f"[GATE] {mt} concentration ({len(same_strategy)}/{MAX_PER_STRATEGY_OPEN}) — skip '{q}'")
+        await _log_reject(reason)
+        return None
+
     portfolio = await db.get_portfolio()
 
     # v4.1 FIX: Circuit breaker applies to ALL strategies (removed ARBITRAGE exemption)

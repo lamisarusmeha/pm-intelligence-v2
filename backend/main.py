@@ -785,19 +785,29 @@ async def trading_loop():
             _strategy_debug["signal_engine_signals"] = len(se_signals)
 
             # -- Enter trades from ALL strategies --
-            # v4.2 FIX: Added signal engine signals (COPY_TRADE/LOCK_IN/BUY_NO_EARLY)
+            # Prioritized: LLM > signal engine > grinder > spike > short > arb
+            # Each strategy capped at 2 entries per cycle for diversification
             all_signals = (
                 llm_signals + se_signals + grinder_signals + spike_signals +
                 short_signals + arb_signals + arb_scan_signals
             )
+            # Sort by score descending so best signals get entered first
+            all_signals.sort(key=lambda s: s.get("score", 0), reverse=True)
+
             entered = 0
-            MAX_ENTRIES_PER_LOOP = 3  # Don't flood — max 3 new trades per cycle
+            MAX_ENTRIES_PER_LOOP = 3   # Max 3 total new trades per cycle
+            MAX_PER_STRATEGY = 2       # Max 2 from any single strategy per cycle
+            strategy_counts = {}
             for sig in all_signals:
                 if entered >= MAX_ENTRIES_PER_LOOP:
                     break
+                st = sig.get("market_type", "?")
+                if strategy_counts.get(st, 0) >= MAX_PER_STRATEGY:
+                    continue  # Diversify — don't load up on one strategy
                 trade = await maybe_enter_trade(sig)
                 if trade:
                     entered += 1
+                    strategy_counts[st] = strategy_counts.get(st, 0) + 1
                     telegram_alerts.alert_trade_entry(trade)
                     if sig.get("market_type") == "BINANCE_ARB":
                         try:

@@ -199,22 +199,22 @@ async def generate_near_certainty_signals(markets: list, binance_prices: dict) -
             if days > 30 or days < 0:
                 continue
 
-            # Filter 2: Price in near-certainty zone (v4.2: 0.75-0.97, was 0.80-0.97)
+            # Filter 2: Price in near-certainty zone (0.80-0.97 — real near-certainty)
             yes_price = market.get("yes_price", 0.5)
             no_price = 1 - yes_price
 
-            if 0.75 <= yes_price <= 0.97:
+            if 0.80 <= yes_price <= 0.97:
                 direction = "YES"
                 entry_price = yes_price
-            elif 0.75 <= no_price <= 0.97:
+            elif 0.80 <= no_price <= 0.97:
                 direction = "NO"
                 entry_price = no_price
             else:
                 continue  # Not in the sweet spot
 
-            # Filter 3: Minimum liquidity
+            # Filter 3: Minimum liquidity ($5K — low-liq markets are traps)
             liquidity = market.get("liquidity", 0) or 0
-            if liquidity < 1000:
+            if liquidity < 5000:
                 continue
 
             # Filter 4: Verification
@@ -227,9 +227,12 @@ async def generate_near_certainty_signals(markets: list, binance_prices: dict) -
             if not verified:
                 continue
 
-            # Score: higher for closer resolution + higher probability
-            score = int(70 + (entry_price - 0.80) * 100 + max(0, (30 - days)) * 0.5)
-            score = min(99, max(70, score))
+            # Score: weighted by probability, time-to-resolution, and liquidity
+            prob_score = (entry_price - 0.80) * 150   # 0-25.5 pts (higher price = better)
+            time_score = max(0, (14 - days)) * 1.5    # 0-21 pts (closer = better, peak at <14d)
+            liq_score = min(15, liquidity / 10000 * 15)  # 0-15 pts (more liquid = better)
+            score = int(60 + prob_score + time_score + liq_score)
+            score = min(99, max(60, score))
 
             signal = {
                 "market_id": market.get("id", ""),
@@ -262,5 +265,10 @@ async def generate_near_certainty_signals(markets: list, binance_prices: dict) -
             print(f"[GRIND] Error processing market: {e}")
             continue
 
-    print(f"[GRIND] Generated {len(signals)} near-certainty signals from {len(markets)} markets")
-    return signals
+    # Rank by score descending and cap at top 5 — quality over quantity
+    signals.sort(key=lambda s: s["score"], reverse=True)
+    top_signals = signals[:5]
+    if len(signals) > 5:
+        print(f"[GRIND] Ranked {len(signals)} signals, keeping top 5")
+    print(f"[GRIND] Generated {len(top_signals)} near-certainty signals from {len(markets)} markets")
+    return top_signals
