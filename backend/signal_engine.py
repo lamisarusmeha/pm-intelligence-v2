@@ -39,9 +39,28 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Tuple
 
 import database as db
-import news_engine
-import wallet_tracker
 import self_improvement_engine as sie
+
+# news_engine and wallet_tracker are optional — stub if missing
+try:
+    import news_engine
+except ImportError:
+    class _StubNews:
+        @staticmethod
+        def get_news_score(q, mid): return 0.0, []
+        @staticmethod
+        def get_news_direction(q, h): return None
+    news_engine = _StubNews()
+
+try:
+    import wallet_tracker
+except ImportError:
+    class _StubWallet:
+        @staticmethod
+        def get_smart_wallet_score(mid): return 0.0
+        @staticmethod
+        def get_smart_wallet_direction(mid): return None
+    wallet_tracker = _StubWallet()
 
 # ── Mode detection thresholds ─────────────────────────────────────────────────
 
