@@ -1046,7 +1046,12 @@ async def get_weights_history() -> list:
             rows = await c.fetchall()
     history = []
     for r in rows:
-        changes = json.loads(r["changes_json"] or "{}")
+        try:
+            changes = json.loads(r["changes_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(changes, dict):
+            continue
         weight_changes = {k: v for k, v in changes.items() if "weight" in k.lower() or "signal" in k.lower()}
         if weight_changes:
             history.append({"changes": weight_changes, "created_at": r["created_at"]})
