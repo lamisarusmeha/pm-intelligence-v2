@@ -46,7 +46,13 @@ from volume_spike_trader import generate_spike_signals
 from binance_arb import generate_arb_signals
 from short_duration_trader import generate_short_duration_signals
 from arbitrage_scanner import scan_arbitrage_opportunities, _verify_direction_haiku
-from signal_engine import generate_signals as generate_signal_engine_signals
+try:
+    from signal_engine import generate_signals as generate_signal_engine_signals
+    HAS_SIGNAL_ENGINE = True
+except Exception as e:
+    HAS_SIGNAL_ENGINE = False
+    print(f"[STARTUP] Signal engine unavailable: {e}")
+    async def generate_signal_engine_signals(markets): return []
 from binance_feed import (
     binance_websocket_loop,
     binance_prices,
@@ -126,9 +132,12 @@ _strategy_debug = {
 
 @asynccontextmanager
 async def lifespan(app):
-    print("[v4.1] PM Intelligence v4.1 — Starting up")
+    print("[v4.3] PM Intelligence v4.3 — Starting up")
     await db.init_db()
-    await memory_system.init_memory()
+    try:
+        await memory_system.init_memory()
+    except Exception as e:
+        print(f"[STARTUP] memory_system.init_memory failed (non-fatal): {e}")
 
     # Memory system startup diagnostic
     try:
